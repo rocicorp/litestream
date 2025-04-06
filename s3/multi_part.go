@@ -40,15 +40,16 @@ type part struct {
 }
 
 // The partManager manages the multi-part download done by the s3.Downloader,
-// implementing the WriterAt interface to buffer data from downloading parts
-// and pipe them to the PipeWriter in the correct order.
+// implementing the WriterAt interface by collecting data from downloading
+// parts in a fixed number of Buffers, and piping them to the PipeWriter in
+// the correct order.
 //
 // The manager manages max `concurrency` parts of `partSize` bytes. The parts
 // begin in the `available` pool with assigned starting positions, moving to
-// the `downloading` pool when writes to the part are requested by the
-// Downloader. When fully written, the parts are transferred to the `done`
-// pool from which they are piped, in order, to the PipeWriter and returned
-// `available` pool to be used for the next part in line.
+// the `downloading` pool when data for the part is received by the Downloader.
+// When fully written, the parts are transferred to the `done` pool from which
+// they are piped, in order, to the PipeWriter and returned `available` pool to
+// be used for the next part in line.
 type partManager struct {
 	w        *io.PipeWriter
 	partSize int64
@@ -61,7 +62,7 @@ type partManager struct {
 	full        chan *part // transfers full parts from downloading to done
 
 	done      sync.Map // parts ready to be flushed
-	flushHead int64    // tracks what has been flushed
+	flushHead int64    // tracks the next position to be flushed
 }
 
 // Exposed for testing
