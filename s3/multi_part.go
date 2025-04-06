@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"sync"
-	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -17,6 +16,8 @@ import (
 func Download(ctx context.Context, sd *s3manager.Downloader, input *s3.GetObjectInput) io.ReadCloser {
 	r, w := io.Pipe()
 	m := NewPartManager(w, sd.PartSize, sd.Concurrency)
+
+	go m.PipeCompletedParts()
 
 	go func() {
 		if _, err := sd.DownloadWithContext(ctx, m, input); err != nil {
@@ -29,8 +30,6 @@ func Download(ctx context.Context, sd *s3manager.Downloader, input *s3.GetObject
 		}
 	}()
 
-	go m.PipeCompletedParts()
-
 	return r
 }
 
@@ -42,47 +41,77 @@ type part struct {
 
 // The partManager manages the multi-part download done by the s3.Downloader,
 // implementing the WriterAt interface to buffer data from downloading parts
-// and pipe them to PipeWriter in the correct order.
+// and pipe them to the PipeWriter in the correct order.
 //
 // The manager manages max `concurrency` parts of `partSize` bytes. The parts
-// begin in the `free` pool with assigned starting positions, moving to the
-// `downloading` pool when writes to the part are requested by the Downloader.
-// When parts is fully written they are transferred to the `done` pool where
-// they are piped, in order, to the PipeWriter and returned `free` pool to be
-// reused for the next part in line.
-//
-// Note that it is important that the `free` pool specifically reserve buffers
-// for the next parts in the download sequence; using an indiscriminate
-// sync.Pool, for example, could otherwise result in head-of-line blocking, e.g.
-// if the head-of-line iss slow to write its first bytes and all buffers are
-// taken by later parts, essentially resulting in a deadlock.
+// begin in the `available` pool with assigned starting positions, moving to
+// the `downloading` pool when writes to the part are requested by the
+// Downloader. When fully written, the parts are transferred to the `done`
+// pool from which they are piped, in order, to the PipeWriter and returned
+// `available` pool to be used for the next part in line.
 type partManager struct {
 	w        *io.PipeWriter
 	partSize int64
 
-	nextInLine atomic.Int64
-	free       sync.Map // maps startPos -> chan *part that receives its reserved buffer
+	freed      *sync.Cond      // conditionalized/signaled access to available
+	nextInLine int64           // tracks the next position allowed to receive data
+	available  map[int64]*part // parts available to receive data
 
-	downloading sync.Map   // maps startPos -> parts receiving data
+	downloading sync.Map   // parts receiving data
 	full        chan *part // transfers full parts from downloading to done
 
-	flushHead int64
-	done      sync.Map // maps startPos -> parts ready to be flushed
+	done      sync.Map // parts ready to be flushed
+	flushHead int64    // tracks what has been flushed
 }
 
 // Exposed for testing
 func NewPartManager(w *io.PipeWriter, partSize int64, concurrency int) *partManager {
 	m := &partManager{
-		w:        w,
-		partSize: partSize,
-		full:     make(chan *part, concurrency),
+		w:         w,
+		partSize:  partSize,
+		freed:     sync.NewCond(&sync.Mutex{}),
+		available: make(map[int64]*part),
+		full:      make(chan *part, concurrency),
 	}
 	for i := 0; i < concurrency; i++ {
-		m.setFree(&part{}, make(chan *part, 1))
+		m.setFree(&part{})
 	}
 	return m
 }
 
+// A naive, first-come-first-serve free pool would be subject to head-of-line
+// blocking. For example, in a pathological case, if the first part is slow to
+// start receiving data, a subsequent part may complete its download and start
+// receiving data for its next part, occupying all `n` buffers before the first
+// part has a chance to reserve a buffer, thereby preventing the entire
+// download from progressing (since parts have to be piped in order).
+//
+// To avoid this, free parts are explicitly reserved for the next parts in
+// line, ensuring that the head of the line will always be able to receive a
+// buffer and keep the pipe flowing.
+func (m *partManager) setFree(p *part) {
+	m.freed.L.Lock()
+	defer m.freed.L.Unlock()
+
+	m.available[m.nextInLine] = p
+	m.nextInLine += m.partSize
+	m.freed.Broadcast()
+}
+
+func (m *partManager) getFree(chunkStart int64) *part {
+	m.freed.L.Lock()
+	defer m.freed.L.Unlock()
+	for {
+		if p, exists := m.available[chunkStart]; exists {
+			delete(m.available, chunkStart)
+			return p
+		}
+		m.freed.Wait()
+	}
+}
+
+// WriteAt is the interface called to receive data for chunks being downloaded
+// by the s3.Downloader.
 func (m *partManager) WriteAt(p []byte, pos int64) (n int, err error) {
 	part := m.getDownloading(pos)
 	n, err = part.buf.Write(p)
@@ -118,24 +147,6 @@ func (m *partManager) getDownloading(pos int64) *part {
 	return part
 }
 
-func (m *partManager) getFree(chunkStart int64) *part {
-	ch, exists := m.free.Load(chunkStart)
-	if !exists {
-		// Although not the common case, it is possible for the download of a
-		// part to kick in before a buffer has been freed for it. In this case
-		// a new channel is created to receive it (rather than reusing the channel
-		// passed to setFree()).
-		ch, _ = m.free.LoadOrStore(chunkStart, make(chan *part, 1))
-	}
-	return <-ch.(chan *part)
-}
-
-func (m *partManager) setFree(c *part, reuseChan chan *part) {
-	nextStart := m.nextInLine.Add(m.partSize) - m.partSize
-	ch, _ := m.free.LoadOrStore(nextStart, reuseChan)
-	ch.(chan *part) <- c
-}
-
 // Exposed for testing
 func (m *partManager) PipeCompletedParts() {
 	for part := range m.full {
@@ -148,7 +159,7 @@ func (m *partManager) PipeCompletedParts() {
 	}
 
 	// Once m.full is closed, there are no more writers.
-	// The final part at the flushHead will be in downloading
+	// The final part at the flushHead will be in m.downloading
 	// if it did not reach the full partSize.
 	m.flush(&m.downloading)
 	m.w.Close()
@@ -163,13 +174,11 @@ func (m *partManager) flush(parts *sync.Map) {
 	for p, exists := parts.Load(m.flushHead); exists; p, exists = parts.Load(m.flushHead) {
 		p := p.(*part)
 		io.Copy(m.w, p.buf)
-		parts.Delete(m.flushHead)
+
 		num := p.written
+		m.setFree(p)
 
-		// Reuse the channel for this part for the next free handoff
-		ch, _ := m.free.Load(p.start)
-		m.setFree(p, ch.(chan *part))
-
+		parts.Delete(m.flushHead)
 		m.flushHead += m.partSize
 
 		// Each part corresponds to an underlying GET in the s3 client.
