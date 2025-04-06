@@ -31,8 +31,8 @@ func testMultiPartDownload(t *testing.T, numBytes int64, partSize int64, concurr
 	}
 
 	r, w := io.Pipe()
-	m := s3.NewChunkManager(w, partSize, concurrency)
-	go m.PipeCompletedChunks()
+	m := s3.NewPartManager(w, partSize, concurrency)
+	go m.PipeCompletedParts()
 
 	var head atomic.Int64
 	nextHead := func() int64 {
@@ -41,7 +41,7 @@ func testMultiPartDownload(t *testing.T, numBytes int64, partSize int64, concurr
 
 	// Simulates the s3.Downloader by running `concurrency` routines that
 	// take `partSize`` slices of the randomBytes from the head and call
-	// m.WriteAt() to randomly send the slices to the chunk manager.
+	// m.WriteAt() to randomly send the slices to the part manager.
 	var requests sync.WaitGroup
 	requests.Add(concurrency)
 	for i := 0; i < concurrency; i++ {

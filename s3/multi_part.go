@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -15,7 +16,7 @@ import (
 
 func Download(ctx context.Context, sd *s3manager.Downloader, input *s3.GetObjectInput) io.ReadCloser {
 	r, w := io.Pipe()
-	m := NewChunkManager(w, sd.PartSize, sd.Concurrency)
+	m := NewPartManager(w, sd.PartSize, sd.Concurrency)
 
 	go func() {
 		if _, err := sd.DownloadWithContext(ctx, m, input); err != nil {
@@ -28,143 +29,150 @@ func Download(ctx context.Context, sd *s3manager.Downloader, input *s3.GetObject
 		}
 	}()
 
-	go m.PipeCompletedChunks()
+	go m.PipeCompletedParts()
 
 	return r
 }
 
-type chunk struct {
+type part struct {
 	start   int64
 	written int64
 	buf     *bytes.Buffer
 }
 
-type chunkManager struct {
+// The partManager manages the multi-part download done by the s3.Downloader,
+// implementing the WriterAt interface to buffer data from downloading parts
+// and pipe them to PipeWriter in the correct order.
+//
+// The manager manages max `concurrency` parts of `partSize` bytes. The parts
+// begin in the `free` pool with assigned starting positions, moving to the
+// `downloading` pool when writes to the part are requested by the Downloader.
+// When parts is fully written they are transferred to the `done` pool where
+// they are piped, in order, to the PipeWriter and returned `free` pool to be
+// reused for the next part in line.
+//
+// Note that it is important that the `free` pool specifically reserve buffers
+// for the next parts in the download sequence; using an indiscriminate
+// sync.Pool, for example, could otherwise result in head-of-line blocking, e.g.
+// if the head-of-line iss slow to write its first bytes and all buffers are
+// taken by later parts, essentially resulting in a deadlock.
+type partManager struct {
 	w        *io.PipeWriter
 	partSize int64
 
-	free         []*chunk   // free pool of buffers
-	nextInLine   *sync.Cond // next in line to start downloading
-	downloadHead int64
-	downloading  sync.Map // maps startPos -> chunks receiving data
+	nextInLine atomic.Int64
+	free       sync.Map // maps startPos -> chan *part that receives its reserved buffer
+
+	downloading sync.Map   // maps startPos -> parts receiving data
+	full        chan *part // transfers full parts from downloading to done
 
 	flushHead int64
-	done      sync.Map // maps startPos -> chunks ready to be flushed
-
-	full chan *chunk // full chunks
+	done      sync.Map // maps startPos -> parts ready to be flushed
 }
 
 // Exposed for testing
-func NewChunkManager(w *io.PipeWriter, partSize int64, concurrency int) *chunkManager {
-	m := &chunkManager{
-		w:          w,
-		partSize:   partSize,
-		free:       make([]*chunk, 0, concurrency),
-		nextInLine: sync.NewCond(&sync.Mutex{}),
-		full:       make(chan *chunk),
+func NewPartManager(w *io.PipeWriter, partSize int64, concurrency int) *partManager {
+	m := &partManager{
+		w:        w,
+		partSize: partSize,
+		full:     make(chan *part, concurrency),
 	}
 	for i := 0; i < concurrency; i++ {
-		m.free = append(m.free, &chunk{})
+		m.setFree(&part{}, make(chan *part, 1))
 	}
 	return m
 }
 
-func (m *chunkManager) WriteAt(p []byte, pos int64) (n int, err error) {
-	chunk := m.getChunk(pos)
-	n, err = chunk.buf.Write(p)
+func (m *partManager) WriteAt(p []byte, pos int64) (n int, err error) {
+	part := m.getDownloading(pos)
+	n, err = part.buf.Write(p)
 	if err == nil {
-		chunk.written += int64(n)
-		if chunk.written >= m.partSize {
-			m.full <- chunk
+		part.written += int64(n)
+		if part.written >= m.partSize {
+			m.full <- part
 		}
 	}
 	return
 }
 
-func (m *chunkManager) getChunk(pos int64) *chunk {
-	chunkStart := pos - (pos % m.partSize)
-	if c, exists := m.downloading.Load(chunkStart); exists {
-		return c.(*chunk)
+func (m *partManager) getDownloading(pos int64) *part {
+	start := pos - (pos % m.partSize)
+	if p, exists := m.downloading.Load(start); exists {
+		return p.(*part)
 	}
 
-	newChunk := m.getFree(chunkStart)
-	newChunk.start = chunkStart
-	newChunk.written = 0
+	part := m.getFree(start)
+	part.start = start
+	part.written = 0
 
-	if newChunk.buf == nil {
-		// Pre-allocate space for the chunk, both for speed and to avoid
+	if part.buf == nil {
+		// Pre-allocate space for the part, both for speed and to avoid
 		// over-allocating with on-demand Buffer growth.
-		newChunk.buf = new(bytes.Buffer)
-		newChunk.buf.Grow(int(m.partSize))
+		part.buf = new(bytes.Buffer)
+		part.buf.Grow(int(m.partSize))
 	} else {
-		newChunk.buf.Reset()
+		part.buf.Reset()
 	}
 
-	m.downloading.Store(chunkStart, newChunk)
-	return newChunk
+	m.downloading.Store(start, part)
+	return part
 }
 
-func (m *chunkManager) getFree(chunkStart int64) *chunk {
-	// To prevent head-of-line blocking, concurrent requesters take from
-	// the free pool in head-of-line order.
-	m.nextInLine.L.Lock()
-	defer m.nextInLine.L.Unlock()
-
-	for m.downloadHead != chunkStart || len(m.free) == 0 {
-		m.nextInLine.Wait()
+func (m *partManager) getFree(chunkStart int64) *part {
+	ch, exists := m.free.Load(chunkStart)
+	if !exists {
+		// Although not the common case, it is possible for the download of a
+		// part to kick in before a buffer has been freed for it. In this case
+		// a new channel is created to receive it (rather than reusing the channel
+		// passed to setFree()).
+		ch, _ = m.free.LoadOrStore(chunkStart, make(chan *part, 1))
 	}
-	num := len(m.free)
-	chunk := m.free[num-1]
-	m.free = m.free[:num-1]
-	m.downloadHead += m.partSize
-
-	m.nextInLine.Broadcast()
-	return chunk
+	return <-ch.(chan *part)
 }
 
-func (m *chunkManager) setFree(c *chunk) {
-	m.nextInLine.L.Lock()
-	defer m.nextInLine.L.Unlock()
-
-	m.free = append(m.free, c)
-	m.nextInLine.Broadcast()
+func (m *partManager) setFree(c *part, reuseChan chan *part) {
+	nextStart := m.nextInLine.Add(m.partSize) - m.partSize
+	ch, _ := m.free.LoadOrStore(nextStart, reuseChan)
+	ch.(chan *part) <- c
 }
 
 // Exposed for testing
-func (m *chunkManager) PipeCompletedChunks() {
-	for chunk := range m.full {
-		// Move the chunk from m.pending to m.done
-		m.downloading.Delete(chunk.start)
-		m.done.Store(chunk.start, chunk)
+func (m *partManager) PipeCompletedParts() {
+	for part := range m.full {
+		// Move the part from downloading to done
+		m.downloading.Delete(part.start)
+		m.done.Store(part.start, part)
 
 		// Flush the head of the line
 		m.flush(&m.done)
 	}
 
 	// Once m.full is closed, there are no more writers.
-	// The final chunk at the flushHead will be in m.pending
+	// The final part at the flushHead will be in downloading
 	// if it did not reach the full partSize.
 	m.flush(&m.downloading)
 	m.w.Close()
 }
 
 // Exposed for testing
-func (m *chunkManager) DownloadDone() {
+func (m *partManager) DownloadDone() {
 	close(m.full)
 }
 
-func (m *chunkManager) flush(chunks *sync.Map) {
-	for c, exists := chunks.Load(m.flushHead); exists; c, exists = chunks.Load(m.flushHead) {
-		chunk := c.(*chunk)
-		io.Copy(m.w, chunk.buf)
-		chunks.Delete(m.flushHead)
-		num := chunk.written
+func (m *partManager) flush(parts *sync.Map) {
+	for p, exists := parts.Load(m.flushHead); exists; p, exists = parts.Load(m.flushHead) {
+		p := p.(*part)
+		io.Copy(m.w, p.buf)
+		parts.Delete(m.flushHead)
+		num := p.written
 
-		m.setFree(chunk)
+		// Reuse the channel for this part for the next free handoff
+		ch, _ := m.free.Load(p.start)
+		m.setFree(p, ch.(chan *part))
 
 		m.flushHead += m.partSize
 
-		// Each chunk corresponds to an underlying GET in the s3 client.
+		// Each part corresponds to an underlying GET in the s3 client.
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
 		internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.Int64Value(&num)))
 	}
