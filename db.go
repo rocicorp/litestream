@@ -1589,6 +1589,17 @@ type RestoreOptions struct {
 
 	// Specifies how many WAL files are downloaded in parallel during restore.
 	Parallelism int
+
+	// Specifies how many parts to download in parallel per file.
+	// If 0, multipart download is disabled and the file is downloaded
+	// sequentially in a single request. May be ignored if not supported
+	// by the implementation.
+	MultipartConcurrency int
+
+	// Specifies the size of the parts to download. If 0, multipart download
+	// is disabled and the file is downloaded sequentially in a single request.
+	// May be ignored if not supported by the implementation.
+	MultipartSize int64
 }
 
 // NewRestoreOptions returns a new instance of RestoreOptions with defaults.

@@ -52,6 +52,10 @@ type ReplicaClient struct {
 	Endpoint       string
 	ForcePathStyle bool
 	SkipVerify     bool
+
+	// S3 object download options
+	MultipartDownloadConcurrency int
+	MultipartDownloadSize        int
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -272,7 +276,7 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 }
 
 // SnapshotReader returns a reader for snapshot data at the given generation/index.
-func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
+func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int, opt *litestream.ReaderOptions) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -282,10 +286,20 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
 
-	out, err := c.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
+	input := &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
-	})
+	}
+
+	if opt != nil && opt.MultipartConcurrency > 0 && opt.MultipartSize > 0 {
+		downloader := s3manager.NewDownloaderWithClient(c.s3, func(d *s3manager.Downloader) {
+			d.Concurrency = opt.MultipartConcurrency
+			d.PartSize = opt.MultipartSize
+		})
+		return Download(ctx, downloader, input), nil
+	}
+
+	out, err := c.s3.GetObjectWithContext(ctx, input)
 	if isNotExists(err) {
 		return nil, os.ErrNotExist
 	} else if err != nil {

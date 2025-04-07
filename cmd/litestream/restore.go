@@ -27,6 +27,8 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	fs.StringVar(&opt.Generation, "generation", "", "generation name")
 	fs.Var((*indexVar)(&opt.Index), "index", "wal index")
 	fs.IntVar(&opt.Parallelism, "parallelism", opt.Parallelism, "parallelism")
+	fs.IntVar(&opt.MultipartConcurrency, "multipart-concurrency", opt.MultipartConcurrency, "multipart-concurrency")
+	fs.Int64Var(&opt.MultipartSize, "multipart-size", opt.MultipartSize, "multipart-size")
 	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
@@ -197,6 +199,19 @@ Arguments:
 	    Determines the number of WAL files downloaded in parallel.
 	    Defaults to `+strconv.Itoa(litestream.DefaultRestoreParallelism)+`.
 
+	-multipart-concurrency NUM
+	    Determines the number of parts to download in parallel per file.
+	    This requires buffering up to multipart-concurrency * multipart-size
+	    bytes in memory. Note that this is only implemented for s3 snapshots;
+	    it is ignored by other implementations.
+	    Defaults to 0 (multipart download disabled).
+
+	-multipart-size BYTES
+	    Downloads the snapshot with -parallelism concurrent requests
+	    in parts of the specified size. This requires buffering up to
+	    parallelism * multipart-size bytes in memory.  Note that this is only
+	    implemented for s3 snapshots; it is ignored by other implementations.
+	    Defaults to 0 (multipart download disabled).
 
 Examples:
 

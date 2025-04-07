@@ -190,7 +190,7 @@ func TestReplicaClient_WriteSnapshot(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if r, err := c.SnapshotReader(context.Background(), "b16ddcf5c697540f", 1000); err != nil {
+		if r, err := c.SnapshotReader(context.Background(), "b16ddcf5c697540f", 1000, nil); err != nil {
 			t.Fatal(err)
 		} else if buf, err := io.ReadAll(r); err != nil {
 			t.Fatal(err)
@@ -217,7 +217,7 @@ func TestReplicaClient_SnapshotReader(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		r, err := c.SnapshotReader(context.Background(), "5efbd8d042012dca", 10)
+		r, err := c.SnapshotReader(context.Background(), "5efbd8d042012dca", 10, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -230,10 +230,34 @@ func TestReplicaClient_SnapshotReader(t *testing.T) {
 		}
 	})
 
+	RunWithReplicaClient(t, "Multipart", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Parallel()
+
+		content := strings.Repeat(`abc123`, 10000)
+		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 10, strings.NewReader(content)); err != nil {
+			t.Fatal(err)
+		}
+
+		r, err := c.SnapshotReader(context.Background(), "5efbd8d042012dca", 10, &litestream.ReaderOptions{
+			MultipartConcurrency: 13,
+			MultipartSize:        123,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+
+		if buf, err := io.ReadAll(r); err != nil {
+			t.Fatal(err)
+		} else if got, want := string(buf), content; got != want {
+			t.Fatalf("ReadAll=%v, want %v", got, want)
+		}
+	})
+
 	RunWithReplicaClient(t, "ErrNotFound", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		if _, err := c.SnapshotReader(context.Background(), "5efbd8d042012dca", 1); !os.IsNotExist(err) {
+		if _, err := c.SnapshotReader(context.Background(), "5efbd8d042012dca", 1, nil); !os.IsNotExist(err) {
 			t.Fatalf("expected not exist, got %#v", err)
 		}
 	})
@@ -241,7 +265,7 @@ func TestReplicaClient_SnapshotReader(t *testing.T) {
 	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		if _, err := c.SnapshotReader(context.Background(), "", 1); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
+		if _, err := c.SnapshotReader(context.Background(), "", 1, nil); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
