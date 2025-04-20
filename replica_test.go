@@ -119,6 +119,133 @@ func TestReplica_Sync(t *testing.T) {
 	}
 }
 
+func expectWatermark(t *testing.T, expected string) {
+	metrics, err := litestream.GatherReplicaMetrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var watermark string
+	for _, family := range metrics {
+		if family.GetName() == "litestream_replica_progress" {
+			if len(family.Metric) != 1 {
+				t.Fatalf("expected 1 litestream_replica_progress metric: %s", family.Metric)
+			}
+			for _, label := range family.Metric[0].GetLabel() {
+				if label.GetName() == "watermark" {
+					watermark = label.GetValue()
+					break
+				}
+			}
+			break
+		}
+	}
+	if watermark != expected {
+		t.Fatalf("expected watermark=%s, got=%s", expected, watermark)
+	}
+}
+
+func TestReplica_SyncWithWatermark(t *testing.T) {
+	db, sqldb := MustOpenDBs(t)
+	defer MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.Exec(`CREATE TABLE versionTable (ignored int, version text)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO versionTable (version) VALUES (?)`, "v123987"); err != nil {
+		t.Fatal(err)
+	}
+	// Ensure this is in the snapshot (main db file).
+	if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(FULL)`); err != nil {
+		t.Fatal(err)
+	}
+	// Configure the watermark to track
+	db.WatermarkTable = "versionTable"
+	db.WatermarkColumn = "version"
+
+	// Issue initial database sync to setup generation.
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fetch current database position.
+	dpos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := file.NewReplicaClient(t.TempDir())
+	r := litestream.NewReplica(db, "")
+	c.Replica, r.Client = r, c
+
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	expectWatermark(t, "v123987")
+
+	// Verify client generation matches database.
+	generations, err := c.Generations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	} else if got, want := len(generations), 1; got != want {
+		t.Fatalf("len(generations)=%v, want %v", got, want)
+	} else if got, want := generations[0], dpos.Generation; got != want {
+		t.Fatalf("generations[0]=%v, want %v", got, want)
+	}
+
+	// Verify we synced checkpoint page to WAL.
+	if r, err := c.WALSegmentReader(context.Background(), nextIndex(dpos)); err != nil {
+		t.Fatal(err)
+	} else if b, err := io.ReadAll(lz4.NewReader(r)); err != nil {
+		t.Fatal(err)
+	} else if err := r.Close(); err != nil {
+		t.Fatal(err)
+	} else if len(b) == db.PageSize() {
+		t.Fatalf("wal mismatch: len(%d), len(%d)", len(b), db.PageSize())
+	}
+
+	// Reset WAL so the next write will only write out the segment we are checking.
+	if err := db.Checkpoint(context.Background(), litestream.CheckpointModeTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	// Execute a query to write something into the truncated WAL.
+	if _, err := sqldb.Exec(`UPDATE versionTable SET version = "v246803", ignored = 123`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sync database to catch up the shadow WAL.
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save position after sync, it should be after our write.
+	dpos, err = db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Sync WAL segment out to replica.
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify WAL matches replica WAL.
+	if b0, err := os.ReadFile(db.Path() + "-wal"); err != nil {
+		t.Fatal(err)
+	} else if r, err := c.WALSegmentReader(context.Background(), dpos.Truncate()); err != nil {
+		t.Fatal(err)
+	} else if b1, err := io.ReadAll(lz4.NewReader(r)); err != nil {
+		t.Fatal(err)
+	} else if err := r.Close(); err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(b0, b1) {
+		t.Fatalf("wal mismatch: len(%d), len(%d)", len(b0), len(b1))
+	}
+
+	expectWatermark(t, "v246803")
+}
+
 func TestReplica_Snapshot(t *testing.T) {
 	db, sqldb := MustOpenDBs(t)
 	defer MustCloseDBs(t, db, sqldb)
