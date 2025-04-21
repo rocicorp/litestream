@@ -5,6 +5,11 @@ import (
 	"io"
 )
 
+type ReaderOptions struct {
+	MultipartConcurrency int
+	MultipartSize        int64
+}
+
 // ReplicaClient represents client to connect to a Replica.
 type ReplicaClient interface {
 	// Returns the type of client.
@@ -29,7 +34,9 @@ type ReplicaClient interface {
 	// Returns a reader that contains LZ4 compressed snapshot data for a
 	// given index within a generation. Returns an os.ErrNotFound error if
 	// the snapshot does not exist.
-	SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error)
+	//
+	// The ReaderOptions may be nil or ignored by the implementation.
+	SnapshotReader(ctx context.Context, generation string, index int, opt *ReaderOptions) (io.ReadCloser, error)
 
 	// Returns an iterator of all WAL segments within a generation on the replica. Order is undefined.
 	WALSegments(ctx context.Context, generation string) (WALSegmentIterator, error)

@@ -203,7 +203,7 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 }
 
 // SnapshotReader returns a reader for snapshot data at the given generation/index.
-func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
+func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int, opt *litestream.ReaderOptions) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
