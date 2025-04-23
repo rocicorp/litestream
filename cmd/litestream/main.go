@@ -257,8 +257,11 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	logOptions := slog.HandlerOptions{
 		Level: slog.LevelInfo,
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			if a.Key == slog.MessageKey {
+			switch a.Key {
+			case slog.MessageKey:
 				a.Key = "message"
+			case slog.TimeKey:
+				a.Key = "timestamp"
 			}
 			return a
 		},
@@ -282,10 +285,7 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	}
 
 	logHandler = logHandler.WithAttrs([]slog.Attr{
-		{
-			Key:   "worker",
-			Value: slog.StringValue("litestream"),
-		},
+		{Key: "worker", Value: slog.StringValue("litestream")},
 	})
 
 	// Set global default logger.
