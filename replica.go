@@ -16,9 +16,11 @@ import (
 
 	"filippo.io/age"
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/benbjohnson/litestream/lite"
 	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	io_prometheus_client "github.com/prometheus/client_model/go"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -283,6 +285,8 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	}
 
 	// Copy frames.
+	var watermark string
+	watermarkPos := r.db.WatermarkPos()
 	for {
 		pos := rd.Pos()
 		assert(pos.Offset == frameAlign(pos.Offset, r.db.pageSize), "shadow wal reader not frame aligned")
@@ -300,6 +304,13 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 			return fmt.Errorf("replica salt mismatch: %s", pos.String())
 		}
 		psalt = salt
+
+		if watermarkPos != nil && binary.BigEndian.Uint32(buf[0:4]) == watermarkPos.Page() {
+			watermark, err = lite.ReadTextValueFromLeafPage(buf[WALFrameHeaderSize:], watermarkPos)
+			if err != nil {
+				return fmt.Errorf("error reading watermark: %w", err)
+			}
+		}
 
 		n, err := zw.Write(buf)
 		if err != nil {
@@ -333,7 +344,7 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
 
 	logger.Info("wal segment written", "position", initialPos.String(), "elapsed", time.Since(startTime).String(), "sz", bytesWritten)
-	return nil
+	return r.exportReplicaWatermark(watermark)
 }
 
 // snapshotN returns the number of snapshots for a generation.
@@ -515,6 +526,17 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 			return info, err
 		}
 	}
+	var watermark string
+	watermarkPos := r.db.WatermarkPos()
+	if watermarkPos != nil {
+		page, err := lite.ReadPage(r.f, watermarkPos.Page(), r.db.PageSize())
+		if err != nil {
+			return info, err
+		}
+		if watermark, err = lite.ReadTextValueFromLeafPage(page, watermarkPos); err != nil {
+			return info, err
+		}
+	}
 	if _, err := r.f.Seek(0, io.SeekStart); err != nil {
 		return info, err
 	}
@@ -566,7 +588,7 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 	}
 
 	logger.Info("snapshot written", "position", pos.String(), "elapsed", time.Since(startTime).String(), "sz", info.Size)
-	return info, nil
+	return info, r.exportReplicaWatermark(watermark)
 }
 
 // EnforceRetention forces a new snapshot once the retention interval has passed.
@@ -1426,33 +1448,73 @@ func (r *Replica) downloadWAL(ctx context.Context, generation string, index int,
 	return nil
 }
 
+func (r *Replica) exportReplicaWatermark(watermark string) error {
+	if len(watermark) == 0 {
+		return nil
+	}
+	replicaProgressGaugeVec.DeletePartialMatch(map[string]string{
+		"db":   r.db.Path(),
+		"name": r.Name(),
+	})
+	gauge, err := replicaProgressGaugeVec.GetMetricWith(map[string]string{
+		"db":        r.db.Path(),
+		"name":      r.Name(),
+		"watermark": watermark,
+	})
+	if err != nil {
+		return err
+	}
+	gauge.SetToCurrentTime()
+	r.Logger().Info(fmt.Sprintf("replication watermark: %s", watermark))
+	return nil
+}
+
 // Replica metrics.
 var (
-	replicaWALBytesCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+	metrics = prometheus.NewRegistry()
+	factory = promauto.With(metrics)
+
+	replicaWALBytesCounterVec = factory.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "litestream",
 		Subsystem: "replica",
 		Name:      "wal_bytes",
 		Help:      "The number wal bytes written",
 	}, []string{"db", "name"})
 
-	replicaWALIndexGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	replicaWALIndexGaugeVec = factory.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "litestream",
 		Subsystem: "replica",
 		Name:      "wal_index",
 		Help:      "The current WAL index",
 	}, []string{"db", "name"})
 
-	replicaWALOffsetGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	replicaWALOffsetGaugeVec = factory.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "litestream",
 		Subsystem: "replica",
 		Name:      "wal_offset",
 		Help:      "The current WAL offset",
 	}, []string{"db", "name"})
 
-	replicaValidationTotalCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+	replicaValidationTotalCounterVec = factory.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "litestream",
 		Subsystem: "replica",
 		Name:      "validation_total",
 		Help:      "The number of validations performed",
 	}, []string{"db", "name", "status"})
+
+	replicaProgressGaugeVec = factory.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "litestream",
+		Subsystem: "replica",
+		Name:      "progress",
+		Help:      "The last replicated watermark and time of replication",
+	}, []string{"db", "name", "watermark"})
 )
+
+func init() {
+	prometheus.MustRegister(metrics)
+}
+
+// Exported for testing.
+func GatherReplicaMetrics() ([]*io_prometheus_client.MetricFamily, error) {
+	return metrics.Gather()
+}

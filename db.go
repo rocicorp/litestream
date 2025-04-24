@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/benbjohnson/litestream/lite"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -103,6 +104,24 @@ type DB struct {
 
 	// The timeout to wait for EBUSY from SQLite.
 	BusyTimeout time.Duration
+
+	// The WatermarkTable is single-row table with a WatermarkColumn that tracks
+	// a text value indicating the version of the database state. The latest
+	// value of this column is exported by the "litestream_replica_progress"
+	// prometheus gauge, with the replica "name" and "watermark" labels
+	// indicating the value of the watermark in the latest replicated snapshot
+	// or wal segment. The value of the gauge is the floating point epoch
+	// seconds when the associated snapshot or wal segment was replicated.
+	//
+	// In order to keep the tracking implementation simple and efficient,
+	// litestream requires that the table content fits well within a single
+	// database page (4kb). As such, the WatermarkTable should contain exactly
+	// one row and its contents should be well under 4KB.
+	WatermarkTable  string
+	WatermarkColumn string
+
+	// Determined from the WatermarkTable and WatermarkColumn
+	watermarkPos *lite.DBPos
 
 	// List of replicas for the database.
 	// Must be set before calling Open().
@@ -243,6 +262,11 @@ func (db *DB) FileInfo() os.FileInfo {
 // DirInfo returns the cached file stats for the parent directory of the database file when it was initialized.
 func (db *DB) DirInfo() os.FileInfo {
 	return db.dirInfo
+}
+
+// The DBPos of the tracked watermark, or nil if none is configured.
+func (db *DB) WatermarkPos() *lite.DBPos {
+	return db.watermarkPos
 }
 
 // Replica returns a replica by name.
@@ -474,6 +498,22 @@ func (db *DB) init() (err error) {
 		return fmt.Errorf("read page size: %w", err)
 	} else if db.pageSize <= 0 {
 		return fmt.Errorf("invalid db page size: %d", db.pageSize)
+	}
+
+	// The WatermarkTable + WatermarkColumn is tracked via a row/column position in a
+	// single database (leaf) page. Note that this relies on the assumptions that:
+	// (1) The table fits within a single page. This is stated as a requirement
+	//     in the comments, and the page type is checked at runtime.
+	// (2) The page number never changes (e.g. the page never gets moved). Although
+	//     pages can technically be moved in a VACUUM operation, the litestream
+	//     read transaction used to prevent wal checkpoints will also prevent
+	//     VACUUM from succeeding, so the page number invariant should also hold.
+	if len(db.WatermarkTable) > 0 && len(db.WatermarkColumn) > 0 {
+		if db.watermarkPos, err = lite.GetDBPos(db.db, db.WatermarkTable, db.WatermarkColumn, 0); err != nil {
+			return err
+		}
+		db.Logger.Info(fmt.Sprintf(`tracking watermark "%s"."%s" on page=%d cid=%d`,
+			db.WatermarkTable, db.WatermarkColumn, db.watermarkPos.Page(), db.watermarkPos.CID()))
 	}
 
 	// Ensure meta directory structure exists.

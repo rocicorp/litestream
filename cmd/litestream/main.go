@@ -303,6 +303,8 @@ type DBConfig struct {
 	BusyTimeout        *time.Duration `yaml:"busy-timeout"`
 	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
 	MaxCheckpointPageN *int           `yaml:"max-checkpoint-page-count"`
+	WatermarkTable     *string        `yaml:"watermark-table"`
+	WatermarkColumn    *string        `yaml:"watermark-column"`
 
 	Replicas []*ReplicaConfig `yaml:"replicas"`
 }
@@ -335,6 +337,10 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	}
 	if dbc.MaxCheckpointPageN != nil {
 		db.MaxCheckpointPageN = *dbc.MaxCheckpointPageN
+	}
+	if dbc.WatermarkTable != nil && dbc.WatermarkColumn != nil {
+		db.WatermarkTable = *dbc.WatermarkTable
+		db.WatermarkColumn = *dbc.WatermarkColumn
 	}
 
 	// Instantiate and attach replicas.
