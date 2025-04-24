@@ -67,19 +67,22 @@ func ReadTextValueFromLeafPage(page []byte, pagePos PagePos) (string, error) {
 	if numCells <= row {
 		return "", fmt.Errorf("insufficient number of cells %d for row %d", numCells, row)
 	}
-	// Lookup the offset to the first row
+	// Lookup the offset to the specified row. These offsets start after the
+	// 8-byte page header, as sequence of 2-byte offsets per row.
 	pageOffset := binary.BigEndian.Uint16(page[8+(row*2):])
 
 	// https://sqlite.org/fileformat.html#cellformat
 	cell := page[pageOffset:]
 	pos := 0
-	// Advanced past the two first varints: payloadSize, rowID
+	// Advanced past the first two varints of the cell: payloadSize, rowID
 	for i := 0; i < 2; i++ {
 		_, bytes := binary.Uvarint(cell[pos:])
 		pos += bytes
 	}
 	// Record format: https://sqlite.org/fileformat.html#record_format
 	header := bytes.NewReader(cell[pos:])
+	// The header consists of an initial (varint) header size, followed
+	// by varint sizes of each column value in cid order.
 	recordHeaderLen, err := binary.ReadUvarint(header)
 	if err != nil {
 		return "", err
