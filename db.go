@@ -500,7 +500,14 @@ func (db *DB) init() (err error) {
 		return fmt.Errorf("invalid db page size: %d", db.pageSize)
 	}
 
-	// Read the watermark table information.
+	// The WatermarkTable + WatermarkColumn is tracked via a row/column position in a
+	// single database (leaf) page. Note that relies on the assumptions that:
+	// (1) The table fits within a single page. This is stated as a requirement
+	//     in the comments, and the page type is checked at runtime.
+	// (2) The page number never changes (e.g. the page never gets moved). Although
+	//     pages can technically be moved in a VACUUM operation, the litestream
+	//     read transaction used to prevent wal checkpoints will also prevent
+	//     VACUUM from succeeding, so the page number invariant should also hold.
 	if len(db.WatermarkTable) > 0 && len(db.WatermarkColumn) > 0 {
 		if db.watermarkPos, err = lite.GetDBPos(db.db, db.WatermarkTable, db.WatermarkColumn, 0); err != nil {
 			return err

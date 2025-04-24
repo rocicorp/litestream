@@ -1456,7 +1456,11 @@ func (r *Replica) exportReplicaWatermark(watermark string) error {
 		"db":   r.db.Path(),
 		"name": r.Name(),
 	})
-	gauge, err := replicaProgressGaugeVec.GetMetricWithLabelValues(r.db.Path(), r.Name(), watermark)
+	gauge, err := replicaProgressGaugeVec.GetMetricWith(map[string]string{
+		"db":        r.db.Path(),
+		"name":      r.Name(),
+		"watermark": watermark,
+	})
 	if err != nil {
 		return err
 	}
