@@ -114,9 +114,9 @@ type DB struct {
 	// seconds when the associated snapshot or wal segment was replicated.
 	//
 	// In order to keep the tracking implementation simple and efficient,
-	// litestream assumes that the table content fits well within a single
+	// litestream requires that the table content fits well within a single
 	// database page (4kb). As such, the WatermarkTable should contain exactly
-	// one row and its values should be well under 4KB.
+	// one row and its contents should be well under 4KB.
 	WatermarkTable  string
 	WatermarkColumn string
 
@@ -501,7 +501,7 @@ func (db *DB) init() (err error) {
 	}
 
 	// The WatermarkTable + WatermarkColumn is tracked via a row/column position in a
-	// single database (leaf) page. Note that relies on the assumptions that:
+	// single database (leaf) page. Note that this relies on the assumptions that:
 	// (1) The table fits within a single page. This is stated as a requirement
 	//     in the comments, and the page type is checked at runtime.
 	// (2) The page number never changes (e.g. the page never gets moved). Although
