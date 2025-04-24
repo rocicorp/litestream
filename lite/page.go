@@ -8,13 +8,13 @@ import (
 	"os"
 )
 
-// The position of a cell value within a page.
+// The position of a value within a page.
 type PagePos interface {
 	Row() int
 	CID() int
 }
 
-// The position of a cell value within the database.
+// The position of a value within the database.
 type DBPos struct {
 	page uint32
 	row  int
@@ -29,7 +29,7 @@ func (pos *DBPos) Page() uint32 { return pos.page }
 func (pos *DBPos) Row() int     { return pos.row }
 func (pos *DBPos) CID() int     { return pos.cid }
 
-// Gets the position of the cell specified by the given `table`, `column`
+// Gets the position of the value specified by the given `table`, `column`
 // and `row` (in ROWID order). This assumes that the table fits within a
 // single database page, i.e. that the `rootpage` of the table in the
 // `sqlite_schema` table points directly to the b-tree leaf page.
@@ -56,31 +56,31 @@ func ReadPage(db *os.File, pageNo uint32, pageSize int) ([]byte, error) {
 	return page, nil
 }
 
-// Reads the cell value with the given `pagePos` from the `page`.
+// Reads the value with the given `pagePos` from the `page`.
 func ReadTextValueFromLeafPage(page []byte, pagePos PagePos) (string, error) {
 	// B-tree page header format: https://sqlite.org/fileformat.html#cell_payload
 	if page[0] != 0xD { // Table b-tree leaf page
 		return "", fmt.Errorf("unexpected page type %x", page[0])
 	}
 	row := pagePos.Row()
-	numCells := int(binary.BigEndian.Uint16(page[3:5]))
-	if numCells <= row {
-		return "", fmt.Errorf("insufficient number of cells %d for row %d", numCells, row)
+	numRows := int(binary.BigEndian.Uint16(page[3:5]))
+	if numRows <= row {
+		return "", fmt.Errorf("insufficient number of rows %d for row %d", numRows, row)
 	}
 	// Lookup the offset to the specified row. These offsets start after the
 	// 8-byte page header, as sequence of 2-byte offsets per row.
 	pageOffset := binary.BigEndian.Uint16(page[8+(row*2):])
 
 	// https://sqlite.org/fileformat.html#cellformat
-	cell := page[pageOffset:]
+	payload := page[pageOffset:]
 	pos := 0
-	// Advanced past the first two varints of the cell: payloadSize, rowID
+	// Advanced past the first two varints of the payload: payloadSize, rowID
 	for i := 0; i < 2; i++ {
-		_, bytes := binary.Uvarint(cell[pos:])
+		_, bytes := binary.Uvarint(payload[pos:])
 		pos += bytes
 	}
 	// Record format: https://sqlite.org/fileformat.html#record_format
-	header := bytes.NewReader(cell[pos:])
+	header := bytes.NewReader(payload[pos:])
 	// The header consists of an initial (varint) header size, followed
 	// by varint sizes of each column value in cid order.
 	recordHeaderLen, err := binary.ReadUvarint(header)
@@ -96,7 +96,7 @@ func ReadTextValueFromLeafPage(page []byte, pagePos PagePos) (string, error) {
 		}
 		valueLen := lengthOf(serialType)
 		if i == pagePos.CID() {
-			return string(cell[pos : pos+valueLen]), nil
+			return string(payload[pos : pos+valueLen]), nil
 		}
 		pos += valueLen
 	}
