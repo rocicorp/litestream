@@ -390,6 +390,19 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
 
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+	}
+
+	if true {
+		downloader := s3manager.NewDownloaderWithClient(c.s3, func(d *s3manager.Downloader) {
+			d.Concurrency = 48
+			d.PartSize = 16777216
+		})
+		return Download(ctx, downloader, input), nil
+	}
+
 	out, err := c.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
