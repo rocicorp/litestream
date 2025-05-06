@@ -47,68 +47,78 @@ func TestReplica_ReadTextValueFromLeafPage(t *testing.T) {
 	sqldb, path := MustOpenSQLDB(t)
 	defer MustCloseSQLDB(t, sqldb)
 
-	if _, err := sqldb.Exec(`CREATE TABLE foo(a TEXT, b INT, c TEXT, d FLOAT, e TEXT, f TEXT)`); err != nil {
+	if _, err := sqldb.Exec(`
+		CREATE TABLE foo(
+			a TEXT, 
+			b INT, 
+			b1 INT GENERATED AS (b*2) VIRTUAL, 
+			b2 INT GENERATED AS (b*3) STORED, 
+			b3 INT HIDDEN,  -- Note: not actually hidden; HIDDEN is only for virtual tables.
+			c TEXT, 
+			d FLOAT,
+			d1 FLOAT GENERATED AS (d*3.14) STORED,
+			d2 FLOAT GENERATED AS (d*3.1415) VIRTUAL,
+			e TEXT, 
+			e1 TEXT GENERATED AS (e||'foo') VIRTUAL,
+			e2 TEXT GENERATED AS (e||'bar') STORED,
+			f TEXT
+		)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sqldb.Exec(`INSERT INTO foo(a, b, c, d, e, f) VALUES (
-	 'abc123', 293482039, 'zzzxyzcba', 19382.383828937238, NULL, 'hello, world'
+	if _, err := sqldb.Exec(`INSERT INTO foo(a, b, b3, c, d, e, f) VALUES (
+	 'abc123', 293482039, 123, 'zzzxyzcba', 19382.383828937238, NULL, 'hello, world'
 	)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sqldb.Exec(`INSERT INTO foo(a, b, c, d, e, f) VALUES (
-		'boomboom', 300, 'bonk', 1, 130, 'zip'
+	if _, err := sqldb.Exec(`INSERT INTO foo(a, b, b3, c, d, e, f) VALUES (
+		'boomboom', 300, 321, 'bonk', 1, 130, 'zip'
 	 )`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sqldb.Exec(`INSERT INTO foo(a, b, c, d, e, f) VALUES (
-		0, 200, 16000, 120800, 82938298, 'after different int sizes'
+	if _, err := sqldb.Exec(`INSERT INTO foo(a, b, b3, c, d, e, f) VALUES (
+		0, 200, 999, 16000, 120800, 82938298, 'after different int sizes'
 	 )`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(FULL)`); err != nil {
 		t.Fatal(err)
 	}
-	var pageNo uint32
 	var pageSize int
 	if err := sqldb.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
-		t.Fatal(err)
-	}
-	if err := sqldb.QueryRow(`SELECT rootpage FROM sqlite_schema WHERE name = 'foo'`).Scan(&pageNo); err != nil {
 		t.Fatal(err)
 	}
 	file, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	page, err := lite.ReadPage(file, pageNo, pageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	var tests = []struct {
 		row       int
-		cid       int
+		column    string
 		watermark string
 	}{
-		{row: 0, cid: 0, watermark: "abc123"},
-		{row: 0, cid: 2, watermark: "zzzxyzcba"},
-		{row: 0, cid: 4, watermark: ""},
-		{row: 0, cid: 5, watermark: "hello, world"},
-		{row: 1, cid: 0, watermark: "boomboom"},
-		{row: 1, cid: 2, watermark: "bonk"},
-		{row: 1, cid: 4, watermark: "130"},
-		{row: 1, cid: 5, watermark: "zip"},
-		{row: 2, cid: 0, watermark: "0"},
-		{row: 2, cid: 2, watermark: "16000"},
-		{row: 2, cid: 4, watermark: "82938298"},
-		{row: 2, cid: 5, watermark: "after different int sizes"},
+		{row: 0, column: "a", watermark: "abc123"},
+		{row: 0, column: "c", watermark: "zzzxyzcba"},
+		{row: 0, column: "e", watermark: ""},
+		{row: 0, column: "f", watermark: "hello, world"},
+		{row: 1, column: "a", watermark: "boomboom"},
+		{row: 1, column: "c", watermark: "bonk"},
+		{row: 1, column: "e", watermark: "130"},
+		{row: 1, column: "f", watermark: "zip"},
+		{row: 2, column: "a", watermark: "0"},
+		{row: 2, column: "c", watermark: "16000"},
+		{row: 2, column: "e", watermark: "82938298"},
+		{row: 2, column: "f", watermark: "after different int sizes"},
 	}
 	for _, test := range tests {
-		pos := lite.NewDBPos(pageNo, test.row, test.cid)
-		if watermark, err := lite.ReadTextValueFromLeafPage(page, pos); err != nil {
+		if pos, err := lite.GetDBPos(sqldb, "foo", test.column, test.row); err != nil {
+			t.Fatal(err)
+		} else if page, err := lite.ReadPage(file, pos.Page(), pageSize); err != nil {
+			t.Fatal(err)
+		} else if watermark, err := lite.ReadTextValueFromLeafPage(page, pos); err != nil {
 			t.Fatal(err)
 		} else if watermark != test.watermark {
-			t.Fatalf("cid=%d, expected: %s, got: %s", test.cid, test.watermark, watermark)
+			t.Fatalf("column=%s (pos=%o), expected: %s, got: %s", test.column, pos, test.watermark, watermark)
 		}
 	}
 }
