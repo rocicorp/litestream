@@ -512,8 +512,8 @@ func (db *DB) init() (err error) {
 		if db.watermarkPos, err = lite.GetDBPos(db.db, db.WatermarkTable, db.WatermarkColumn, 0); err != nil {
 			return err
 		}
-		db.Logger.Info(fmt.Sprintf(`tracking watermark "%s"."%s" on page=%d cid=%d`,
-			db.WatermarkTable, db.WatermarkColumn, db.watermarkPos.Page(), db.watermarkPos.CID()))
+		db.Logger.Info(fmt.Sprintf(`tracking watermark "%s"."%s" on page=%d col=%d`,
+			db.WatermarkTable, db.WatermarkColumn, db.watermarkPos.Page(), db.watermarkPos.Col()))
 	}
 
 	// Ensure meta directory structure exists.

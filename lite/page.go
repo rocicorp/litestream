@@ -11,23 +11,23 @@ import (
 // The position of a value within a page.
 type PagePos interface {
 	Row() int
-	CID() int
+	Col() int
 }
 
 // The position of a value within the database.
 type DBPos struct {
 	page uint32
 	row  int
-	cid  int
+	col  int
 }
 
-func NewDBPos(page uint32, row int, cid int) *DBPos {
-	return &DBPos{page: page, row: row, cid: cid}
+func NewDBPos(page uint32, row int, col int) *DBPos {
+	return &DBPos{page: page, row: row, col: col}
 }
 
 func (pos *DBPos) Page() uint32 { return pos.page }
 func (pos *DBPos) Row() int     { return pos.row }
-func (pos *DBPos) CID() int     { return pos.cid }
+func (pos *DBPos) Col() int     { return pos.col }
 
 // Gets the position of the value specified by the given `table`, `column`
 // and `row` (in ROWID order). This assumes that the table fits within a
@@ -89,7 +89,7 @@ func ReadTextValueFromLeafPage(page []byte, pagePos PagePos) (string, error) {
 	// Record format: https://sqlite.org/fileformat.html#record_format
 	header := bytes.NewReader(payload[pos:])
 	// The header consists of an initial (varint) header size, followed
-	// by varint sizes of each column value in cid order.
+	// by varint sizes of each stored column value.
 	recordHeaderLen, err := binary.ReadUvarint(header)
 	if err != nil {
 		return "", err
@@ -102,7 +102,7 @@ func ReadTextValueFromLeafPage(page []byte, pagePos PagePos) (string, error) {
 			return "", nil
 		}
 		valueLen := lengthOf(serialType)
-		if i == pagePos.CID() {
+		if i == pagePos.Col() {
 			return string(payload[pos : pos+valueLen]), nil
 		}
 		pos += valueLen
