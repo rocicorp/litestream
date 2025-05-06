@@ -36,15 +36,22 @@ func (pos *DBPos) CID() int     { return pos.cid }
 func GetDBPos(db *sql.DB, table string, column string, row int) (*DBPos, error) {
 	var pageNo uint32
 	var cid int
-	if err := db.QueryRow(`SELECT cid FROM pragma_table_info(?) where name = ?`, table, column).
+	var numVirtual int
+	if err := db.QueryRow(`SELECT cid FROM pragma_table_xinfo(?) where name = ?`, table, column).
 		Scan(&cid); err != nil {
 		return nil, fmt.Errorf(`lookup db pos ("%s"."%s") cid: %w`, table, column, err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_xinfo(?) where cid < ? and hidden = 2`, table, cid).
+		Scan(&numVirtual); err != nil {
+		return nil, fmt.Errorf(`lookup db pos ("%s"."%s") numVirtual: %w`, table, column, err)
 	}
 	if err := db.QueryRow(`SELECT rootpage FROM sqlite_schema WHERE name = ?`, table).
 		Scan(&pageNo); err != nil {
 		return nil, fmt.Errorf("lookup %s rootpage: %w", table, err)
 	}
-	return NewDBPos(pageNo, row, cid), nil
+	// Subtract the number of `GENERATED ... VIRTUAL` columns from the cid to
+	// get the position of the value in the page.
+	return NewDBPos(pageNo, row, cid-numVirtual), nil
 }
 
 // Reads the page for the given `pageNo` from the main db file.
