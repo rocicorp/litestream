@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -37,9 +38,8 @@ var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing snapshots & WAL segments to disk.
 type ReplicaClient struct {
-	mu       sync.Mutex
-	s3       *s3.S3 // s3 service
-	uploader *s3manager.Uploader
+	mu sync.Mutex
+	s3 *s3.S3 // s3 service
 
 	// AWS authentication keys.
 	AccessKeyID     string
@@ -102,7 +102,6 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		return fmt.Errorf("cannot create aws session: %w", err)
 	}
 	c.s3 = s3.New(sess)
-	c.uploader = s3manager.NewUploader(sess)
 	return nil
 }
 
@@ -241,8 +240,37 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (lites
 	return newSnapshotIterator(ctx, c, generation), nil
 }
 
+// TODO: Allow concurrency and part size to be optimized, similarly
+// to the multipart download API.
+func (c *ReplicaClient) newUploader(uncompressedSize int64) *s3manager.Uploader {
+	return s3manager.NewUploaderWithClient(c.s3, func(d *s3manager.Uploader) {
+		// The Uploader attempts to perform an initSize() optimization to configure the
+		// upload part size based on the total upload size. However, this is only possible
+		// if the io.Reader that it is given implements io.Seeker:
+		//
+		// https://github.com/aws/aws-sdk-go/blob/163aada692ed32951f979aacf452ded4c03b8a7c/service/s3/s3manager/upload.go#L440
+		//
+		// For litestream, the Reader is a PipeReader through which the uploaded bytes run
+		// through LZ4 compression, so seeking (and thus, the optimization) is not possible.
+		// Instead, emulate the Uploader logic based on the uncompressedSize of the
+		// data being uploaded. This will be an overestimate and result in larger
+		// than necessary part sizes, which is fine.
+
+		// Adapted from:
+		// https://github.com/aws/aws-sdk-go/blob/163aada692ed32951f979aacf452ded4c03b8a7c/service/s3/s3manager/upload.go#L451
+
+		// Try to adjust partSize if it is too small and account for
+		// integer division truncation.
+		if uncompressedSize/d.PartSize >= int64(d.MaxUploadParts) {
+			// Add one to the part size to account for remainders
+			// during the size calculation. e.g odd number of bytes.
+			d.PartSize = (uncompressedSize / int64(d.MaxUploadParts)) + 1
+		}
+	})
+}
+
 // WriteSnapshot writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
+func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, rd io.Reader, uncompressedSize int64) (info litestream.SnapshotInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
 	}
@@ -254,7 +282,9 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 	startTime := time.Now()
 
 	rc := internal.NewReadCounter(rd)
-	if _, err := c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
+	uploader := c.newUploader(uncompressedSize)
+	slog.Debug(fmt.Sprintf("uploading snapshot with part size %d", uploader.PartSize))
+	if _, err := uploader.UploadWithContext(ctx, &s3manager.UploadInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
 		Body:   rc,
@@ -346,7 +376,7 @@ func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (lit
 }
 
 // WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
+func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader, uncompressedSize int64) (info litestream.WALSegmentInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
 	}
@@ -358,7 +388,8 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 	startTime := time.Now()
 
 	rc := internal.NewReadCounter(rd)
-	if _, err := c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
+	uploader := c.newUploader(uncompressedSize)
+	if _, err := uploader.UploadWithContext(ctx, &s3manager.UploadInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
 		Body:   rc,
