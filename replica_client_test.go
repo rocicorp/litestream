@@ -67,11 +67,11 @@ func TestReplicaClient_Generations(t *testing.T) {
 		t.Parallel()
 
 		// Write snapshots.
-		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 0, strings.NewReader(`foo`)); err != nil {
+		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 0, strings.NewReader(`foo`), 3); err != nil {
 			t.Fatal(err)
-		} else if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 0, strings.NewReader(`bar`)); err != nil {
+		} else if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 0, strings.NewReader(`bar`), 3); err != nil {
 			t.Fatal(err)
-		} else if _, err := c.WriteSnapshot(context.Background(), "155fe292f8333c72", 0, strings.NewReader(`baz`)); err != nil {
+		} else if _, err := c.WriteSnapshot(context.Background(), "155fe292f8333c72", 0, strings.NewReader(`baz`), 3); err != nil {
 			t.Fatal(err)
 		}
 
@@ -103,11 +103,11 @@ func TestReplicaClient_Snapshots(t *testing.T) {
 		t.Parallel()
 
 		// Write snapshots.
-		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 1, strings.NewReader(``)); err != nil {
+		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 1, strings.NewReader(``), 0); err != nil {
 			t.Fatal(err)
-		} else if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 5, strings.NewReader(`x`)); err != nil {
+		} else if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 5, strings.NewReader(`x`), 1); err != nil {
 			t.Fatal(err)
-		} else if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 10, strings.NewReader(`xyz`)); err != nil {
+		} else if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 10, strings.NewReader(`xyz`), 3); err != nil {
 			t.Fatal(err)
 		}
 
@@ -186,7 +186,7 @@ func TestReplicaClient_WriteSnapshot(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 1000, strings.NewReader(`foobar`)); err != nil {
+		if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 1000, strings.NewReader(`foobar`), 6); err != nil {
 			t.Fatal(err)
 		}
 
@@ -203,7 +203,7 @@ func TestReplicaClient_WriteSnapshot(t *testing.T) {
 
 	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-		if _, err := c.WriteSnapshot(context.Background(), "", 0, nil); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
+		if _, err := c.WriteSnapshot(context.Background(), "", 0, nil, 0); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -213,7 +213,7 @@ func TestReplicaClient_SnapshotReader(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 10, strings.NewReader(`foo`)); err != nil {
+		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 10, strings.NewReader(`foo`), 3); err != nil {
 			t.Fatal(err)
 		}
 
@@ -234,7 +234,7 @@ func TestReplicaClient_SnapshotReader(t *testing.T) {
 		t.Parallel()
 
 		content := strings.Repeat(`abc123`, 10000)
-		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 10, strings.NewReader(content)); err != nil {
+		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 10, strings.NewReader(content), int64(len(content))); err != nil {
 			t.Fatal(err)
 		}
 
@@ -275,14 +275,14 @@ func TestReplicaClient_WALs(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 1, Offset: 0}, strings.NewReader(``)); err != nil {
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 1, Offset: 0}, strings.NewReader(``), 0); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 2, Offset: 0}, strings.NewReader(`12345`)); err != nil {
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 2, Offset: 0}, strings.NewReader(`12345`), 5); err != nil {
 			t.Fatal(err)
-		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 2, Offset: 5}, strings.NewReader(`67`)); err != nil {
+		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 2, Offset: 5}, strings.NewReader(`67`), 2); err != nil {
 			t.Fatal(err)
-		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 3, Offset: 0}, strings.NewReader(`xyz`)); err != nil {
+		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 3, Offset: 0}, strings.NewReader(`xyz`), 3); err != nil {
 			t.Fatal(err)
 		}
 
@@ -363,7 +363,7 @@ func TestReplicaClient_WALs(t *testing.T) {
 	RunWithReplicaClient(t, "NoWALs", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 0, strings.NewReader(`foo`)); err != nil {
+		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 0, strings.NewReader(`foo`), 3); err != nil {
 			t.Fatal(err)
 		}
 
@@ -395,7 +395,7 @@ func TestReplicaClient_WriteWALSegment(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1000, Offset: 2000}, strings.NewReader(`foobar`)); err != nil {
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1000, Offset: 2000}, strings.NewReader(`foobar`), 6); err != nil {
 			t.Fatal(err)
 		}
 
@@ -412,7 +412,7 @@ func TestReplicaClient_WriteWALSegment(t *testing.T) {
 
 	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "", Index: 0, Offset: 0}, nil); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "", Index: 0, Offset: 0}, nil, 0); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -422,7 +422,7 @@ func TestReplicaClient_WALReader(t *testing.T) {
 
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 10, Offset: 5}, strings.NewReader(`foobar`)); err != nil {
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 10, Offset: 5}, strings.NewReader(`foobar`), 6); err != nil {
 			t.Fatal(err)
 		}
 
@@ -452,9 +452,9 @@ func TestReplicaClient_DeleteWALSegments(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1, Offset: 2}, strings.NewReader(`foo`)); err != nil {
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1, Offset: 2}, strings.NewReader(`foo`), 3); err != nil {
 			t.Fatal(err)
-		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 3, Offset: 4}, strings.NewReader(`bar`)); err != nil {
+		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 3, Offset: 4}, strings.NewReader(`bar`), 3); err != nil {
 			t.Fatal(err)
 		}
 

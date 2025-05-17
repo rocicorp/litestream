@@ -25,8 +25,11 @@ type ReplicaClient interface {
 	Snapshots(ctx context.Context, generation string) (SnapshotIterator, error)
 
 	// Writes LZ4 compressed snapshot data to the replica at a given index
-	// within a generation. Returns metadata for the snapshot.
-	WriteSnapshot(ctx context.Context, generation string, index int, r io.Reader) (SnapshotInfo, error)
+	// within a generation. The uncompressedSize is supplied to allow
+	// implementations to perform appropriate optimizations.
+	//
+	// Returns metadata for the snapshot.
+	WriteSnapshot(ctx context.Context, generation string, index int, r io.Reader, uncompressedSize int64) (SnapshotInfo, error)
 
 	// Deletes a snapshot with the given generation & index.
 	DeleteSnapshot(ctx context.Context, generation string, index int) error
@@ -42,8 +45,11 @@ type ReplicaClient interface {
 	WALSegments(ctx context.Context, generation string) (WALSegmentIterator, error)
 
 	// Writes an LZ4 compressed WAL segment at a given position.
+	// The uncompressedSize is supplied to allow implementations to perform
+	// appropriate optimizations.
+	//
 	// Returns metadata for the written segment.
-	WriteWALSegment(ctx context.Context, pos Pos, r io.Reader) (WALSegmentInfo, error)
+	WriteWALSegment(ctx context.Context, pos Pos, r io.Reader, uncompressedSize int64) (WALSegmentInfo, error)
 
 	// Deletes one or more WAL segments at the given positions.
 	DeleteWALSegments(ctx context.Context, a []Pos) error

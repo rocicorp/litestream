@@ -236,7 +236,7 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	// Copy through pipe into client from the starting position.
 	var g errgroup.Group
 	g.Go(func() error {
-		_, err := r.Client.WriteWALSegment(ctx, pos, pr)
+		_, err := r.Client.WriteWALSegment(ctx, pos, pr, rd.N())
 
 		// Always close pipe reader to signal writers.
 		if e := pr.CloseWithError(err); err == nil {
@@ -515,6 +515,10 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 			return info, err
 		}
 	}
+	stat, err := r.f.Stat()
+	if err != nil {
+		return info, err
+	}
 	if _, err := r.f.Seek(0, io.SeekStart); err != nil {
 		return info, err
 	}
@@ -559,7 +563,7 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 
 	startTime := time.Now()
 	// Delegate write to client & wait for writer goroutine to finish.
-	if info, err = r.Client.WriteSnapshot(ctx, pos.Generation, pos.Index, pr); err != nil {
+	if info, err = r.Client.WriteSnapshot(ctx, pos.Generation, pos.Index, pr, stat.Size()); err != nil {
 		return info, err
 	} else if err := g.Wait(); err != nil {
 		return info, err
