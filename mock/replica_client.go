@@ -36,7 +36,7 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (lites
 	return c.SnapshotsFunc(ctx, generation)
 }
 
-func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, r io.Reader) (litestream.SnapshotInfo, error) {
+func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, r io.Reader, uncompressedSize int64) (litestream.SnapshotInfo, error) {
 	return c.WriteSnapshotFunc(ctx, generation, index, r)
 }
 
@@ -52,7 +52,7 @@ func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (lit
 	return c.WALSegmentsFunc(ctx, generation)
 }
 
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, r io.Reader) (litestream.WALSegmentInfo, error) {
+func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, r io.Reader, uncompressedSize int64) (litestream.WALSegmentInfo, error) {
 	return c.WriteWALSegmentFunc(ctx, pos, r)
 }
 

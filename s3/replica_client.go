@@ -242,7 +242,7 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (lites
 }
 
 // WriteSnapshot writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
+func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, rd io.Reader, uncompressedSize int64) (info litestream.SnapshotInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
 	}
@@ -346,7 +346,7 @@ func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (lit
 }
 
 // WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
+func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader, uncompressedSize int64) (info litestream.WALSegmentInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
 	}
