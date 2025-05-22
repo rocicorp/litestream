@@ -1115,14 +1115,10 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// Initialize starting position.
 	pos := Pos{Generation: opt.Generation, Index: minWALIndex}
 	tmpPath := opt.OutputPath + ".tmp"
-	readerOpts := &ReaderOptions{
-		MultipartConcurrency: opt.MultipartConcurrency,
-		MultipartSize:        opt.MultipartSize,
-	}
 
 	// Copy snapshot to output path.
 	r.Logger().Info("restoring snapshot", "generation", opt.Generation, "index", minWALIndex, "path", tmpPath)
-	if err := r.restoreSnapshot(ctx, pos.Generation, pos.Index, tmpPath, readerOpts); err != nil {
+	if err := r.restoreSnapshot(ctx, pos.Generation, pos.Index, tmpPath); err != nil {
 		return fmt.Errorf("cannot restore snapshot: %w", err)
 	}
 
@@ -1343,7 +1339,7 @@ func (r *Replica) walSegmentMap(ctx context.Context, generation string, minIndex
 }
 
 // restoreSnapshot copies a snapshot from the replica to a file.
-func (r *Replica) restoreSnapshot(ctx context.Context, generation string, index int, filename string, opt *ReaderOptions) error {
+func (r *Replica) restoreSnapshot(ctx context.Context, generation string, index int, filename string) error {
 	// Determine the user/group & mode based on the DB, if available.
 	var fileInfo, dirInfo os.FileInfo
 	if db := r.DB(); db != nil {
@@ -1360,7 +1356,7 @@ func (r *Replica) restoreSnapshot(ctx context.Context, generation string, index 
 	}
 	defer f.Close()
 
-	rd, err := r.Client.SnapshotReader(ctx, generation, index, opt)
+	rd, err := r.Client.SnapshotReader(ctx, generation, index)
 	if err != nil {
 		return err
 	}
