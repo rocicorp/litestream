@@ -275,7 +275,7 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 }
 
 // SnapshotReader returns a reader for snapshot data at the given generation/index.
-func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int, opt *litestream.ReaderOptions) (_ io.ReadCloser, err error) {
+func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (_ io.ReadCloser, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)

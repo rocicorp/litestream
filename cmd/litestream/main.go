@@ -375,6 +375,20 @@ type ReplicaConfig struct {
 	Endpoint        string `yaml:"endpoint"`
 	ForcePathStyle  *bool  `yaml:"force-path-style"`
 	SkipVerify      bool   `yaml:"skip-verify"`
+	// Determines the number of parts to upload or download in parallel per file.
+	// This requires buffering up to multipart-concurrency * multipart-size
+	// bytes in memory. Note that this is only implemented for s3, and when
+	// restoring, only for snapshots (and not for wal segments).
+	// It is ignored by other implementations.
+	//
+	// If unspecified, uses the AWS sdk default value of 5.
+	// Set to 0 to disable multipart downloads.
+	MultipartConcurrency *int `yaml:"multipart-concurrency"`
+	// Determines the size of each part to upload or download.
+	// See documentation for multipart-concurrency.
+	//
+	// If unspecified, uses the AWS sdk default of 5MB.
+	MultipartSize *int64 `yaml:"multipart-size"`
 
 	// ABS settings
 	AccountName string `yaml:"account-name"`
@@ -554,6 +568,8 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *s
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
+	client.MultipartConcurrency = c.MultipartConcurrency
+	client.MultipartSize = c.MultipartSize
 	return client, nil
 }
 
