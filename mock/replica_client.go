@@ -44,7 +44,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 	return c.DeleteSnapshotFunc(ctx, generation, index)
 }
 
-func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int, opt *litestream.ReaderOptions) (io.ReadCloser, error) {
+func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
 	return c.SnapshotReaderFunc(ctx, generation, index)
 }
 

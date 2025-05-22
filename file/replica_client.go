@@ -236,7 +236,7 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 
 // SnapshotReader returns a reader for snapshot data at the given generation/index.
 // Returns os.ErrNotExist if no matching index is found.
-func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int, opt *litestream.ReaderOptions) (io.ReadCloser, error) {
+func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
 	filename, err := c.SnapshotPath(generation, index)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)

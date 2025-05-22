@@ -53,9 +53,9 @@ type ReplicaClient struct {
 	ForcePathStyle bool
 	SkipVerify     bool
 
-	// S3 object download options
-	MultipartDownloadConcurrency int
-	MultipartDownloadSize        int
+	// S3 object multipart options
+	MultipartConcurrency *int
+	MultipartSize        *int64
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -244,6 +244,13 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (lites
 // to the multipart download API.
 func (c *ReplicaClient) newUploader(uncompressedSize int64) *s3manager.Uploader {
 	return s3manager.NewUploaderWithClient(c.s3, func(d *s3manager.Uploader) {
+		if c.MultipartConcurrency != nil {
+			d.Concurrency = *c.MultipartConcurrency
+		}
+		if c.MultipartSize != nil {
+			d.PartSize = *c.MultipartSize
+		}
+
 		// The Uploader attempts to perform an initSize() optimization to configure the
 		// upload part size based on the total upload size. However, this is only possible
 		// if the io.Reader that it is given implements io.Seeker:
@@ -283,7 +290,7 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 
 	rc := internal.NewReadCounter(rd)
 	uploader := c.newUploader(uncompressedSize)
-	slog.Debug(fmt.Sprintf("uploading snapshot with part size %d", uploader.PartSize))
+	slog.Debug(fmt.Sprintf("uploading snapshot in %d parallel parts of size %d", uploader.Concurrency, uploader.PartSize))
 	if _, err := uploader.UploadWithContext(ctx, &s3manager.UploadInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
@@ -306,7 +313,7 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 }
 
 // SnapshotReader returns a reader for snapshot data at the given generation/index.
-func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int, opt *litestream.ReaderOptions) (io.ReadCloser, error) {
+func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -321,24 +328,30 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 		Key:    aws.String(key),
 	}
 
-	if opt != nil && opt.MultipartConcurrency > 0 && opt.MultipartSize > 0 {
-		downloader := s3manager.NewDownloaderWithClient(c.s3, func(d *s3manager.Downloader) {
-			d.Concurrency = opt.MultipartConcurrency
-			d.PartSize = opt.MultipartSize
-		})
-		return Download(ctx, downloader, input), nil
+	if c.MultipartConcurrency != nil && *c.MultipartConcurrency == 0 {
+		// Multipart downloads are explicitly disabled by setting concurrency to 0.
+		out, err := c.s3.GetObjectWithContext(ctx, input)
+		if isNotExists(err) {
+			return nil, os.ErrNotExist
+		} else if err != nil {
+			return nil, err
+		}
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
+		internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.Int64Value(out.ContentLength)))
+
+		return out.Body, nil
 	}
 
-	out, err := c.s3.GetObjectWithContext(ctx, input)
-	if isNotExists(err) {
-		return nil, os.ErrNotExist
-	} else if err != nil {
-		return nil, err
-	}
-	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.Int64Value(out.ContentLength)))
-
-	return out.Body, nil
+	downloader := s3manager.NewDownloaderWithClient(c.s3, func(d *s3manager.Downloader) {
+		if c.MultipartConcurrency != nil {
+			d.Concurrency = *c.MultipartConcurrency
+		}
+		if c.MultipartSize != nil {
+			d.PartSize = *c.MultipartSize
+		}
+	})
+	slog.Debug(fmt.Sprintf("downloading snapshot in %d parallel parts of size %d", downloader.Concurrency, downloader.PartSize))
+	return Download(ctx, downloader, input), nil
 }
 
 // DeleteSnapshot deletes a snapshot with the given generation & index.
