@@ -549,12 +549,8 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *s
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
-	if c.MultipartConcurrency != nil {
-		*client.MultipartConcurrency = *c.MultipartConcurrency
-	}
-	if c.MultipartSize != nil {
-		*client.MultipartSize = *c.MultipartSize
-	}
+	client.MultipartConcurrency = c.MultipartConcurrency
+	client.MultipartSize = c.MultipartSize
 	return client, nil
 }
 
