@@ -1487,7 +1487,22 @@ func (db *DB) monitor() {
 
 		// Sync the database to the shadow WAL.
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
-			db.Logger.Error("sync error", "error", err)
+			// Passive checkpoints immediately fail if a write happens to be in
+			// progress on the database, even if a busy_timeout is set:
+			// https://sqlite.org/pragma.html#pragma_wal_checkpoint
+			//
+			// For databases with a high rate of writes, this results in a high
+			// amount of "error" messages for a condition that is not really an
+			// error, as passive checkpoints are intended to be best effort.
+			//
+			// To better reflect the nature of the condition in the least invasive
+			// way possible, the condition is still propagated as an error in the
+			// implementation, but logged at a lower severity here.
+			if strings.Contains(err.Error(), "checkpoint: mode=PASSIVE err=database is locked") {
+				db.Logger.Info("skipped periodic checkpoint because database was busy", "error", err)
+			} else {
+				db.Logger.Error("sync error", "error", err)
+			}
 		}
 	}
 }
