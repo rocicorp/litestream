@@ -510,8 +510,10 @@ func NewS3ReplicaClient(tb testing.TB) *s3.ReplicaClient {
 	c.Endpoint = *s3Endpoint
 	c.ForcePathStyle = *s3ForcePathStyle
 	c.SkipVerify = *s3SkipVerify
-	c.MultipartConcurrency = 5
-	c.MultipartSize = 100
+	multipartConcurrency := 5
+	multipartSize := int64(100)
+	c.MultipartConcurrency = &multipartConcurrency
+	c.MultipartSize = &multipartSize
 	return c
 }
 
