@@ -33,9 +33,9 @@ func Download(ctx context.Context, sd *s3manager.Downloader, input *s3.GetObject
 }
 
 type part struct {
-	start   int64
-	written int64
-	buf     []byte
+	start      int64
+	maxWritten int64
+	buf        []byte
 }
 
 // The partManager manages the multi-part download done by the s3.Downloader,
@@ -125,9 +125,9 @@ func (m *partManager) WriteAt(p []byte, pos int64) (n int, err error) {
 		return n, io.ErrShortWrite
 	}
 
-	if end > part.written {
-		part.written = end
-		if part.written >= m.partSize {
+	if end > part.maxWritten {
+		part.maxWritten = end
+		if part.maxWritten >= m.partSize {
 			m.full <- part
 		}
 	}
@@ -143,7 +143,7 @@ func (m *partManager) getDownloading(pos int64) *part {
 
 	part := m.getFree(start)
 	part.start = start
-	part.written = 0
+	part.maxWritten = 0
 
 	if part.buf == nil {
 		part.buf = make([]byte, int(m.partSize))
@@ -179,9 +179,9 @@ func (m *partManager) DownloadDone() {
 func (m *partManager) flush(parts *sync.Map) {
 	for p, exists := parts.Load(m.flushHead); exists; p, exists = parts.Load(m.flushHead) {
 		p := p.(*part)
-		m.w.Write(p.buf[:int(p.written)])
+		m.w.Write(p.buf[:int(p.maxWritten)])
 
-		num := p.written
+		num := p.maxWritten
 		m.setFree(p)
 
 		parts.Delete(m.flushHead)
