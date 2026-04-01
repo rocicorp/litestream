@@ -1176,6 +1176,17 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Download WAL files to disk in parallel.
 	g, ctx := errgroup.WithContext(ctx)
+	// An error in one of the go routines spawned by the group will result in canceling
+	// the context, hiding the underlying error in an unhelpful "context canceled" error.
+	// Log both the error and the underlying cause, returning the latter if present.
+	logAndUnwrap := func(err error) error {
+		cause := context.Cause(ctx)
+		r.Logger().Error("error downloading wal", "error", err, "cause", cause)
+		if cause != nil {
+			return cause
+		}
+		return err
+	}
 	for i := 0; i < parallelism; i++ {
 		g.Go(func() error {
 			for {
@@ -1204,7 +1215,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 					// Returning the error here will cancel the other goroutines.
 					if err != nil {
-						return err
+						return logAndUnwrap(err)
 					}
 
 					r.Logger().Info("downloaded wal",
@@ -1222,7 +1233,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		mu.Lock()
 		for !walStates[index-minWALIndex].ready {
 			if err := ctx.Err(); err != nil {
-				return err
+				return logAndUnwrap(err)
 			}
 			cond.Wait()
 		}
@@ -1242,7 +1253,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// Ensure all goroutines finish. All errors should have been handled during
 	// the processing of WAL files but this ensures that all processing is done.
 	if err := g.Wait(); err != nil {
-		return err
+		return logAndUnwrap(err)
 	}
 
 	// Copy file to final location.
