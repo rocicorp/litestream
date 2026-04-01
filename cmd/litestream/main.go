@@ -286,6 +286,7 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 
 	logHandler = logHandler.WithAttrs([]slog.Attr{
 		{Key: "worker", Value: slog.StringValue("litestream")},
+		{Key: "cmd", Value: slog.StringValue((os.Args[1]))},
 	})
 
 	// Set global default logger.
