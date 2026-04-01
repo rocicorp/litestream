@@ -68,3 +68,42 @@ func testMultiPartDownload(t *testing.T, numBytes int64, partSize int64, concurr
 		t.Fatalf("downloaded bytes not equal")
 	}
 }
+
+func TestMultiPartDownloadRetryRewritesPart(t *testing.T) {
+	const partSize int64 = 8
+	payload := []byte("abcdefghijklmnop")
+
+	r, w := io.Pipe()
+	m := s3.NewPartManager(w, partSize, 1)
+	go m.PipeCompletedParts()
+
+	type readResult struct {
+		buf []byte
+		err error
+	}
+	resultCh := make(chan readResult, 1)
+	go func() {
+		buf, err := io.ReadAll(r)
+		resultCh <- readResult{buf: buf, err: err}
+	}()
+
+	if _, err := m.WriteAt(payload[:3], 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.WriteAt(payload[:int(partSize)], 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.WriteAt(payload[int(partSize):], partSize); err != nil {
+		t.Fatal(err)
+	}
+
+	m.DownloadDone()
+
+	result := <-resultCh
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if !bytes.Equal(payload, result.buf) {
+		t.Fatalf("unexpected payload: %q", result.buf)
+	}
+}

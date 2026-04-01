@@ -1,7 +1,6 @@
 package s3
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"os"
@@ -34,9 +33,9 @@ func Download(ctx context.Context, sd *s3manager.Downloader, input *s3.GetObject
 }
 
 type part struct {
-	start   int64
-	written int64
-	buf     *bytes.Buffer
+	start      int64
+	maxWritten int64
+	buf        []byte
 }
 
 // The partManager manages the multi-part download done by the s3.Downloader,
@@ -115,14 +114,25 @@ func (m *partManager) getFree(chunkStart int64) *part {
 // by the s3.Downloader.
 func (m *partManager) WriteAt(p []byte, pos int64) (n int, err error) {
 	part := m.getDownloading(pos)
-	n, err = part.buf.Write(p)
-	if err == nil {
-		part.written += int64(n)
-		if part.written >= m.partSize {
+	off := pos - part.start
+	end := off + int64(len(p))
+	if off < 0 || end > int64(len(part.buf)) {
+		return 0, io.ErrShortWrite
+	}
+
+	n = copy(part.buf[int(off):int(end)], p)
+	if n != len(p) {
+		return n, io.ErrShortWrite
+	}
+
+	if end > part.maxWritten {
+		part.maxWritten = end
+		if part.maxWritten >= m.partSize {
 			m.full <- part
 		}
 	}
-	return
+
+	return n, nil
 }
 
 func (m *partManager) getDownloading(pos int64) *part {
@@ -133,15 +143,10 @@ func (m *partManager) getDownloading(pos int64) *part {
 
 	part := m.getFree(start)
 	part.start = start
-	part.written = 0
+	part.maxWritten = 0
 
 	if part.buf == nil {
-		// Pre-allocate space for the part, both for speed and to avoid
-		// over-allocating with on-demand Buffer growth.
-		part.buf = new(bytes.Buffer)
-		part.buf.Grow(int(m.partSize))
-	} else {
-		part.buf.Reset()
+		part.buf = make([]byte, int(m.partSize))
 	}
 
 	m.downloading.Store(start, part)
@@ -174,9 +179,9 @@ func (m *partManager) DownloadDone() {
 func (m *partManager) flush(parts *sync.Map) {
 	for p, exists := parts.Load(m.flushHead); exists; p, exists = parts.Load(m.flushHead) {
 		p := p.(*part)
-		io.Copy(m.w, p.buf)
+		m.w.Write(p.buf[:int(p.maxWritten)])
 
-		num := p.written
+		num := p.maxWritten
 		m.setFree(p)
 
 		parts.Delete(m.flushHead)
