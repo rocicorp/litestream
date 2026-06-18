@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pierrec/lz4/v4"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
@@ -93,6 +94,111 @@ func TestReplica_Sync(t *testing.T) {
 	}
 
 	// TODO(ltx): Restore snapshot and verify
+}
+
+func TestReplica_SyncWithWatermark(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "db")
+
+	sqldb := testingutil.MustOpenSQLDB(t, dbPath)
+	if _, err := sqldb.ExecContext(ctx, `
+		CREATE TABLE version_table(
+			ignored INT,
+			virtual_ignored INT GENERATED ALWAYS AS (ignored * 2) VIRTUAL,
+			version TEXT
+		)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO version_table(ignored, version) VALUES (1, 'v123987')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `PRAGMA wal_checkpoint(FULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqldb.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	client := file.NewReplicaClient(t.TempDir())
+	db := testingutil.NewDB(t, dbPath)
+	db.MonitorInterval = 0
+	db.WatermarkTable = "version_table"
+	db.WatermarkColumn = "version"
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer testingutil.MustCloseDB(t, db)
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	expectWatermark(t, db.Path(), "file", "v123987")
+
+	sqldb = testingutil.MustOpenSQLDB(t, dbPath)
+	if _, err := sqldb.ExecContext(ctx, `UPDATE version_table SET version = 'v246803', ignored = 123`); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqldb.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	expectWatermark(t, db.Path(), "file", "v246803")
+	expectNoWatermark(t, db.Path(), "file", "v123987")
+}
+
+func expectWatermark(tb testing.TB, dbPath, replicaName, expected string) {
+	tb.Helper()
+	if !hasWatermarkMetric(tb, dbPath, replicaName, expected) {
+		tb.Fatalf("expected watermark metric %q for db=%s replica=%s", expected, dbPath, replicaName)
+	}
+}
+
+func expectNoWatermark(tb testing.TB, dbPath, replicaName, unexpected string) {
+	tb.Helper()
+	if hasWatermarkMetric(tb, dbPath, replicaName, unexpected) {
+		tb.Fatalf("unexpected watermark metric %q for db=%s replica=%s", unexpected, dbPath, replicaName)
+	}
+}
+
+func hasWatermarkMetric(tb testing.TB, dbPath, replicaName, watermark string) bool {
+	tb.Helper()
+
+	metrics, err := litestream.GatherReplicaMetrics()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for _, family := range metrics {
+		if family.GetName() != "litestream_replica_progress" {
+			continue
+		}
+		for _, metric := range family.Metric {
+			labels := metricLabels(metric)
+			if labels["db"] == dbPath && labels["name"] == replicaName && labels["watermark"] == watermark {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func metricLabels(metric *dto.Metric) map[string]string {
+	labels := make(map[string]string)
+	for _, label := range metric.GetLabel() {
+		labels[label.GetName()] = label.GetValue()
+	}
+	return labels
 }
 
 // TestReplica_RestoreAndReplicateAfterDataLoss tests the scenario described in issue #781

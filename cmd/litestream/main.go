@@ -709,6 +709,8 @@ type DBConfig struct {
 	BusyTimeout        *time.Duration `yaml:"busy-timeout"`
 	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
 	TruncatePageN      *int           `yaml:"truncate-page-n"`
+	WatermarkTable     *string        `yaml:"watermark-table"`
+	WatermarkColumn    *string        `yaml:"watermark-column"`
 
 	RestoreIfDBNotExists bool `yaml:"restore-if-db-not-exists"`
 
@@ -749,6 +751,10 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	}
 	if dbc.TruncatePageN != nil {
 		db.TruncatePageN = *dbc.TruncatePageN
+	}
+	if dbc.WatermarkTable != nil && dbc.WatermarkColumn != nil {
+		db.WatermarkTable = *dbc.WatermarkTable
+		db.WatermarkColumn = *dbc.WatermarkColumn
 	}
 
 	// Instantiate and attach replica.

@@ -24,6 +24,7 @@ import (
 	"modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/benbjohnson/litestream/lite"
 )
 
 // Default DB settings.
@@ -161,6 +162,18 @@ type DB struct {
 
 	// The timeout to wait for EBUSY from SQLite.
 	BusyTimeout time.Duration
+
+	// WatermarkTable is a single-row table with a WatermarkColumn that tracks
+	// a text value indicating the version of the database state. The latest
+	// value is exported by the litestream_replica_progress Prometheus gauge
+	// after an LTX file containing that watermark value is replicated.
+	//
+	// The table content must fit within a single database page. The table
+	// should contain exactly one row and its contents should be well under 4KB.
+	WatermarkTable  string
+	WatermarkColumn string
+
+	watermarkPos *lite.DBPos
 
 	// Minimum time to retain L0 files after they have been compacted into L1.
 	L0Retention time.Duration
@@ -538,6 +551,11 @@ func (db *DB) FileInfo() os.FileInfo {
 // DirInfo returns the cached file stats for the parent directory of the database file when it was initialized.
 func (db *DB) DirInfo() os.FileInfo {
 	return db.dirInfo
+}
+
+// WatermarkPos returns the tracked watermark position, or nil if none is configured.
+func (db *DB) WatermarkPos() *lite.DBPos {
+	return db.watermarkPos
 }
 
 // Pos returns the current replication position of the database.
@@ -1026,6 +1044,17 @@ func (db *DB) init(ctx context.Context) (err error) {
 		return fmt.Errorf("read page size: %w", err)
 	} else if db.pageSize <= 0 {
 		return fmt.Errorf("invalid db page size: %d", db.pageSize)
+	}
+
+	if db.WatermarkTable != "" && db.WatermarkColumn != "" {
+		if db.watermarkPos, err = lite.GetDBPos(db.db, db.WatermarkTable, db.WatermarkColumn, 0); err != nil {
+			return err
+		}
+		db.Logger.Info("tracking watermark",
+			"table", db.WatermarkTable,
+			"column", db.WatermarkColumn,
+			"page", db.watermarkPos.Page(),
+			"col", db.watermarkPos.Col())
 	}
 
 	// Ensure meta directory structure exists.
@@ -2200,14 +2229,25 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
+	pos, r, _, err := db.snapshotReader(ctx)
+	return pos, r, err
+}
+
+type watermarkResult struct {
+	value string
+	err   error
+}
+
+func (db *DB) snapshotReader(ctx context.Context) (ltx.Pos, io.Reader, <-chan watermarkResult, error) {
+	watermarkCh := make(chan watermarkResult, 1)
 	if db.PageSize() == 0 {
 		db.Logger.Debug("page size not initialized yet", "pageSize", 0)
-		return ltx.Pos{}, nil, &DBNotReadyError{Reason: "page size not initialized"}
+		return ltx.Pos{}, nil, nil, &DBNotReadyError{Reason: "page size not initialized"}
 	}
 
 	pos, err := db.Pos()
 	if err != nil {
-		return pos, nil, fmt.Errorf("pos: %w", err)
+		return pos, nil, nil, fmt.Errorf("pos: %w", err)
 	}
 
 	db.Logger.Debug("snapshot", "txid", pos.TXID.String())
@@ -2220,7 +2260,7 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 
 	fi, err := db.f.Stat()
 	if err != nil {
-		return pos, nil, err
+		return pos, nil, nil, err
 	}
 	commit := uint32(fi.Size() / int64(db.pageSize))
 
@@ -2248,6 +2288,13 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 		}
 		if walCommit > 0 {
 			commit = walCommit
+		}
+
+		watermark, err := db.readWatermarkFromPageMap(walFile, pageMap, true)
+		watermarkCh <- watermarkResult{value: watermark, err: err}
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("read watermark: %w", err))
+			return
 		}
 
 		var sz int64
@@ -2297,7 +2344,7 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 		_ = pw.Close()
 	}()
 
-	return pos, pr, nil
+	return pos, pr, watermarkCh, nil
 }
 
 // Compact performs a compaction of the LTX file at the previous level into dstLevel.
@@ -2324,7 +2371,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 
 // SnapshotDB writes a snapshot to the replica for the current position of the database.
 func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
-	pos, r, err := db.SnapshotReader(ctx)
+	pos, r, watermarkCh, err := db.snapshotReader(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -2336,6 +2383,14 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	db.maxLTXFileInfos.Lock()
 	db.maxLTXFileInfos.m[SnapshotLevel] = info
 	db.maxLTXFileInfos.Unlock()
+
+	watermarkResult := <-watermarkCh
+	if watermarkResult.err != nil {
+		return info, watermarkResult.err
+	}
+	if err := db.Replica.exportReplicaWatermark(watermarkResult.value); err != nil {
+		return info, err
+	}
 
 	return info, nil
 }

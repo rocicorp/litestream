@@ -1603,6 +1603,54 @@ dbs:
 	})
 }
 
+func TestDBConfig_WatermarkFields(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "litestream.yml")
+	if err := os.WriteFile(filename, []byte(`
+dbs:
+  - path: /tmp/test.db
+    watermark-table: version_table
+    watermark-column: version
+    replica:
+      url: file:///tmp/replica
+`[1:]), 0666); err != nil {
+		t.Fatal(err)
+	}
+
+	config, err := main.ReadConfigFile(filename, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(config.DBs) != 1 {
+		t.Fatal("expected one database config")
+	}
+
+	dbc := config.DBs[0]
+	if dbc.WatermarkTable == nil {
+		t.Fatal("expected watermark-table to be set")
+	}
+	if got, want := *dbc.WatermarkTable, "version_table"; got != want {
+		t.Errorf("WatermarkTable = %q, want %q", got, want)
+	}
+	if dbc.WatermarkColumn == nil {
+		t.Fatal("expected watermark-column to be set")
+	}
+	if got, want := *dbc.WatermarkColumn, "version"; got != want {
+		t.Errorf("WatermarkColumn = %q, want %q", got, want)
+	}
+
+	db, err := main.NewDBFromConfig(dbc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := db.WatermarkTable, "version_table"; got != want {
+		t.Errorf("db.WatermarkTable = %q, want %q", got, want)
+	}
+	if got, want := db.WatermarkColumn, "version"; got != want {
+		t.Errorf("db.WatermarkColumn = %q, want %q", got, want)
+	}
+}
+
 func TestFindSQLiteDatabases(t *testing.T) {
 	// Create a temporary directory using t.TempDir() - automatically cleaned up
 	tmpDir := t.TempDir()

@@ -85,6 +85,14 @@ func (r *Replica) Logger() *slog.Logger {
 	return logger.With("replica", r.Client.Type())
 }
 
+// Name returns the replica identifier used in logs and metrics.
+func (r *Replica) Name() string {
+	if r.Client == nil {
+		return ""
+	}
+	return r.Client.Type()
+}
+
 // DB returns a reference to the database the replica is attached to, if any.
 func (r *Replica) DB() *DB { return r.db }
 
@@ -187,6 +195,11 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	}
 	defer func() { _ = f.Close() }()
 
+	watermark, err := r.readWatermarkFromLTXFile(f)
+	if err != nil {
+		return fmt.Errorf("read watermark: %w", err)
+	}
+
 	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
 	if err != nil {
 		return fmt.Errorf("write ltx file: %w", err)
@@ -201,7 +214,7 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	//replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
 	//replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
 
-	return nil
+	return r.exportReplicaWatermark(watermark)
 }
 
 // calcPos returns the last position saved to the replica for level 0.
