@@ -78,6 +78,16 @@ func LitestreamVFSRegister() *C.char {
 
 	vfs := litestream.NewVFS(client, logger)
 
+	// Override the poll interval is specified.
+	// TODO: Remove when https://github.com/benbjohnson/litestream/pull/1157 lands.
+	if s := os.Getenv("LITESTREAM_POLL_INTERVAL"); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return C.CString(fmt.Sprintf("invalid LITESTREAM_POLL_INTERVAL: %s", err))
+		}
+		vfs.PollInterval = d
+	}
+
 	// Configure write support if enabled.
 	if strings.ToLower(os.Getenv("LITESTREAM_WRITE_ENABLED")) == "true" {
 		vfs.WriteEnabled = true
