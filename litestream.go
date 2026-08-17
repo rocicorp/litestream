@@ -522,8 +522,11 @@ func ParseWALSegmentPath(s string) (index int, offset int64, err error) {
 	}
 
 	i64, _ := strconv.ParseUint(a[1], 16, 64)
-	off64, _ := strconv.ParseUint(a[2], 16, 64)
-	return int(i64), int64(off64), nil
+	off64, err := strconv.ParseInt(a[2], 16, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid wal segment path: %s: %w", s, err)
+	}
+	return int(i64), off64, nil
 }
 
 // FormatWALSegmentPath formats a WAL segment filename with a given index & offset.
@@ -533,7 +536,7 @@ func FormatWALSegmentPath(index int, offset int64) string {
 	return fmt.Sprintf("%08x_%08x%s", index, offset, WALSegmentExt)
 }
 
-var walSegmentPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(?:_([0-9a-f]{8}))\.wal\.lz4$`)
+var walSegmentPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(?:_([0-9a-f]{8,16}))\.wal\.lz4$`)
 
 // isHexChar returns true if ch is a lowercase hex character.
 func isHexChar(ch rune) bool {

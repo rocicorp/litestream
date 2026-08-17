@@ -121,11 +121,56 @@ func TestWALSegmentPath(t *testing.T) {
 			t.Fatalf("WALPath()=%v, want %v", got, want)
 		}
 	})
+	t.Run("WideOffset", func(t *testing.T) {
+		if got, err := litestream.WALSegmentPath("foo", "0123456701234567", 0x12c3, 0x11a6bfa58); err != nil {
+			t.Fatal(err)
+		} else if want := "foo/generations/0123456701234567/wal/000012c3_11a6bfa58.wal.lz4"; got != want {
+			t.Fatalf("WALPath()=%v, want %v", got, want)
+		}
+	})
 	t.Run("ErrNoGeneration", func(t *testing.T) {
 		if _, err := litestream.WALSegmentPath("foo", "", 1000, 0); err == nil || err.Error() != `generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
+}
+
+func TestParseWALSegmentPath(t *testing.T) {
+	tests := []struct {
+		path   string
+		index  int
+		offset int64
+	}{
+		{path: "000012c3_00000000.wal.lz4", index: 0x12c3, offset: 0},
+		{path: "000012c3_11a6bfa58.wal.lz4", index: 0x12c3, offset: 0x11a6bfa58},
+		{path: "00000001_26cea1250.wal.lz4", index: 1, offset: 0x26cea1250},
+		{path: "00000d26_2d4df59b0.wal.lz4", index: 0xd26, offset: 0x2d4df59b0},
+		{path: "7fffffff_7fffffffffffffff.wal.lz4", index: 0x7fffffff, offset: 0x7fffffffffffffff},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			index, offset, err := litestream.ParseWALSegmentPath(tt.path)
+			if err != nil {
+				t.Fatal(err)
+			} else if index != tt.index {
+				t.Fatalf("index=%x, want %x", index, tt.index)
+			} else if offset != tt.offset {
+				t.Fatalf("offset=%x, want %x", offset, tt.offset)
+			}
+		})
+	}
+
+	for _, path := range []string{
+		"000012c3_1234567.wal.lz4",
+		"000012c3_8000000000000000.wal.lz4",
+		"000012c3_123456789abcdef01.wal.lz4",
+	} {
+		t.Run("Invalid/"+path, func(t *testing.T) {
+			if _, _, err := litestream.ParseWALSegmentPath(path); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
 }
 
 func TestFindMinSnapshotByGeneration(t *testing.T) {

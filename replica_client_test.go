@@ -260,6 +260,8 @@ func TestReplicaClient_WALs(t *testing.T) {
 			t.Fatal(err)
 		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 3, Offset: 0}, strings.NewReader(`xyz`), 3); err != nil {
 			t.Fatal(err)
+		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 3, Offset: 0x11a6bfa58}, strings.NewReader(`wide`), 4); err != nil {
+			t.Fatal(err)
 		}
 
 		itr, err := c.WALSegments(context.Background(), "b16ddcf5c697540f")
@@ -272,7 +274,7 @@ func TestReplicaClient_WALs(t *testing.T) {
 		a, err := litestream.SliceWALSegmentIterator(itr)
 		if err != nil {
 			t.Fatal(err)
-		} else if got, want := len(a), 3; got != want {
+		} else if got, want := len(a), 4; got != want {
 			t.Fatalf("len=%v, want %v", got, want)
 		}
 		sort.Sort(litestream.WALSegmentInfoSlice(a))
@@ -313,6 +315,19 @@ func TestReplicaClient_WALs(t *testing.T) {
 		} else if got, want := a[2].Size, int64(3); got != want {
 			t.Fatalf("Size=%v, want %v", got, want)
 		} else if a[1].CreatedAt.IsZero() {
+			t.Fatalf("expected CreatedAt")
+		}
+
+		// Verify wide offsets survive formatting and listing.
+		if got, want := a[3].Generation, "b16ddcf5c697540f"; got != want {
+			t.Fatalf("Generation=%v, want %v", got, want)
+		} else if got, want := a[3].Index, 3; got != want {
+			t.Fatalf("Index=%v, want %v", got, want)
+		} else if got, want := a[3].Offset, int64(0x11a6bfa58); got != want {
+			t.Fatalf("Offset=%v, want %v", got, want)
+		} else if got, want := a[3].Size, int64(4); got != want {
+			t.Fatalf("Size=%v, want %v", got, want)
+		} else if a[3].CreatedAt.IsZero() {
 			t.Fatalf("expected CreatedAt")
 		}
 
