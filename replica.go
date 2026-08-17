@@ -1422,27 +1422,6 @@ func (r *Replica) downloadWAL(ctx context.Context, generation string, index int,
 		fileInfo = db.fileInfo
 	}
 
-	// Open readers for every segment in the WAL file, in order.
-	var readers []io.Reader
-	for _, offset := range offsets {
-		rd, err := r.Client.WALSegmentReader(ctx, Pos{Generation: generation, Index: index, Offset: offset})
-		if err != nil {
-			return err
-		}
-		defer rd.Close()
-
-		if len(r.AgeIdentities) > 0 {
-			drd, err := age.Decrypt(rd, r.AgeIdentities...)
-			if err != nil {
-				return err
-			}
-
-			rd = io.NopCloser(drd)
-		}
-
-		readers = append(readers, lz4.NewReader(rd))
-	}
-
 	// Open handle to destination WAL path.
 	f, err := internal.CreateFile(fmt.Sprintf("%s-%08x-wal", dbPath, index), fileInfo)
 	if err != nil {
@@ -1450,10 +1429,28 @@ func (r *Replica) downloadWAL(ctx context.Context, generation string, index int,
 	}
 	defer f.Close()
 
-	// Combine segments together and copy WAL to target path.
-	if _, err := io.Copy(f, io.MultiReader(readers...)); err != nil {
-		return err
-	} else if err := f.Close(); err != nil {
+	// Open and copy each segment in order so later network readers do not sit idle.
+	for _, offset := range offsets {
+		rd, err := r.Client.WALSegmentReader(ctx, Pos{Generation: generation, Index: index, Offset: offset})
+		if err != nil {
+			return err
+		}
+
+		var src io.Reader = rd
+		if len(r.AgeIdentities) > 0 {
+			src, err = age.Decrypt(rd, r.AgeIdentities...)
+		}
+		if err == nil {
+			_, err = io.Copy(f, lz4.NewReader(src))
+		}
+		closeErr := rd.Close()
+		if err != nil {
+			return err
+		} else if closeErr != nil {
+			return closeErr
+		}
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return nil
