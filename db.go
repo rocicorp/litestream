@@ -65,19 +65,20 @@ const (
 // with indefinite write blocking (issue #724). All checkpoints now use either
 // PASSIVE (non-blocking) or TRUNCATE (emergency only) modes.
 type DB struct {
-	mu        sync.RWMutex
-	execSem   *semaphore.Weighted
-	path      string        // part to database
-	metaPath  string        // Path to the database metadata.
-	db        *sql.DB       // target database
-	f         *os.File      // long-running db file descriptor
-	rtx       *sql.Tx       // long running read transaction
-	pageSize  int           // page size, in bytes
-	notify    chan struct{} // closes on WAL change
-	chkMu     sync.RWMutex  // checkpoint lock
-	opened    bool          // true if Open() was called and Close() not yet called
-	syncState syncState
-	syncDiag  diagState
+	mu           sync.RWMutex
+	compactionMu sync.Mutex // held (via TryLock) for the duration of one compaction/snapshot to serialize them per-DB
+	execSem      *semaphore.Weighted
+	path         string        // part to database
+	metaPath     string        // Path to the database metadata.
+	db           *sql.DB       // target database
+	f            *os.File      // long-running db file descriptor
+	rtx          *sql.Tx       // long running read transaction
+	pageSize     int           // page size, in bytes
+	notify       chan struct{} // closes on WAL change
+	chkMu        sync.RWMutex  // checkpoint lock
+	opened       bool          // true if Open() was called and Close() not yet called
+	syncState    syncState
+	syncDiag     diagState
 
 	// last file info for each level
 	maxLTXFileInfos struct {

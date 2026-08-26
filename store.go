@@ -23,6 +23,15 @@ var (
 	// re-compaction when restarting the process.
 	ErrCompactionTooEarly = errors.New("compaction too early")
 
+	// ErrCompactionInProgress is returned when a compaction or snapshot is
+	// already running for the same database. Compaction levels and the snapshot
+	// level run in independent goroutines; without this guard a snapshot (L9)
+	// and a lower-level compaction can run concurrently for one database, each
+	// retaining a database-sized in-memory page index. On a large database that
+	// overlap can exhaust the memory limit and trigger an OOM kill. The monitor
+	// treats this like ErrNoCompaction and retries on its next interval.
+	ErrCompactionInProgress = errors.New("compaction in progress")
+
 	// ErrTxNotAvailable is returned when a transaction does not exist.
 	ErrTxNotAvailable = errors.New("transaction not available")
 
@@ -587,6 +596,8 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			switch {
 			case errors.Is(err, ErrNoCompaction), errors.Is(err, ErrCompactionTooEarly):
 				db.Logger.Debug("no compaction", "level", lvl.Level, "path", db.Path())
+			case errors.Is(err, ErrCompactionInProgress):
+				db.Logger.Debug("compaction already in progress for db, skipping", "level", lvl.Level, "path", db.Path())
 			case errors.Is(err, ErrDBNotReady):
 				db.Logger.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
 				notReadyDBs = append(notReadyDBs, db.Path())
@@ -767,6 +778,18 @@ func (s *Store) allDatabasesHealthy(since time.Time) bool {
 // CompactDB performs a compaction or snapshot for a given database on a single destination level.
 // This function will only proceed if a compaction has not occurred before the last compaction time.
 func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*ltx.FileInfo, error) {
+	// Serialize compaction/snapshot per database. The snapshot level and each
+	// compaction level run in independent goroutines (see Store.Open), so
+	// without this guard a snapshot (L9) and a lower-level compaction can run
+	// concurrently for the same DB. Each retains a database-sized in-memory page
+	// index, and on a large database the overlap can exhaust the memory limit
+	// and trigger an OOM kill. If another compaction is already running for this
+	// DB, skip this tick; the monitor retries on its next interval.
+	if !db.compactionMu.TryLock() {
+		return nil, ErrCompactionInProgress
+	}
+	defer db.compactionMu.Unlock()
+
 	// Skip if database is not yet initialized (page size unknown).
 	if db.PageSize() == 0 {
 		return nil, &DBNotReadyError{Reason: "page size not initialized"}
