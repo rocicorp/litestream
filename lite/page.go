@@ -57,7 +57,10 @@ func GetDBPos(db *sql.DB, table string, column string, row int) (*DBPos, error) 
 // Reads the page for the given `pageNo` from the main db file.
 func ReadPage(db *os.File, pageNo uint32, pageSize int) ([]byte, error) {
 	page := make([]byte, pageSize)
-	if _, err := db.ReadAt(page, int64((pageNo-1)*uint32(pageSize))); err != nil {
+	// Compute the byte offset in int64. Widening only happens *after* the
+	// multiply if it is done in uint32, so a page living past the 4 GiB mark
+	// (pageNo > 4 GiB / pageSize) would wrap around and read an unrelated page.
+	if _, err := db.ReadAt(page, int64(pageNo-1)*int64(pageSize)); err != nil {
 		return nil, err
 	}
 	return page, nil

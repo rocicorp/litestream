@@ -1,6 +1,7 @@
 package lite_test
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
 	"os"
@@ -40,6 +41,60 @@ func MustCloseSQLDB(tb testing.TB, d *sql.DB) {
 	tb.Helper()
 	if err := d.Close(); err != nil {
 		tb.Fatal(err)
+	}
+}
+
+// TestReadPage_WideOffset verifies that ReadPage reads the correct byte offset
+// for a page whose offset exceeds 4 GiB. A previous implementation computed the
+// offset with `(pageNo-1) * uint32(pageSize)`, which overflows uint32 for any
+// page past the 4 GiB mark and reads an unrelated page from earlier in the file.
+// On large replicas this caused litestream to export a random application row's
+// text (e.g. a cuid primary key) as the watermark. See lite.ReadPage.
+func TestReadPage_WideOffset(t *testing.T) {
+	const pageSize = 4096
+	// Page whose byte offset is just past 4 GiB, so the old uint32 multiply
+	// wraps to a small offset (here, 4096) instead of the true ~4 GiB offset.
+	// Kept as a var (not const) so the buggy uint32 math below is evaluated at
+	// runtime rather than rejected as a constant overflow.
+	pageNo := uint32(1<<20) + 2 // 1048578
+
+	correctOffset := int64(pageNo-1) * int64(pageSize)
+	wrappedOffset := int64((pageNo - 1) * uint32(pageSize)) // the old, buggy math
+	if wrappedOffset == correctOffset {
+		t.Fatalf("test misconfigured: offset %d did not overflow uint32", correctOffset)
+	}
+
+	path := filepath.Join(t.TempDir(), "db")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Write a decoy page at the wrapped offset and the real page at the true
+	// offset. The file is sparse (~4 GiB logical, a few KB physical).
+	decoy := make([]byte, pageSize)
+	for i := range decoy {
+		decoy[i] = 0xDD
+	}
+	want := make([]byte, pageSize)
+	for i := range want {
+		want[i] = 0xCC
+	}
+	copy(want, []byte("correct-page"))
+	if _, err := f.WriteAt(decoy, wrappedOffset); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(want, correctOffset); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := lite.ReadPage(f, pageNo, pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("ReadPage read the wrong offset (got %x…, want %x…): uint32 overflow", got[:16], want[:16])
 	}
 }
 
