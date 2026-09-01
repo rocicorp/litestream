@@ -769,6 +769,17 @@ func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size 
 	// than remain, which a single ranged GET would silently clamp.
 	total := size
 	if total <= 0 || (haveRemaining && remaining < total) {
+		if size > 0 && haveRemaining {
+			// Callers derive the size from the replica listing and LTX files are
+			// immutable, so asking for more than exists means the listing and
+			// the object disagree -- a truncated upload, or a stale index. The
+			// read is clamped to what a single ranged GET would have returned,
+			// which keeps this consistent with the other backends, but the
+			// mismatch is worth surfacing: it will otherwise resurface as a
+			// confusing LTX decode failure further downstream.
+			c.logger.Debug("requested size exceeds object length",
+				"key", key, "offset", offset, "requested", size, "available", remaining)
+		}
 		total = remaining
 	}
 

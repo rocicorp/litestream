@@ -1096,3 +1096,75 @@ func TestFetchPageIndex_ShortRead(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// TestFetchPageIndex_RequestsBoundedRanges verifies the page index fetch tells
+// the client how many bytes it wants rather than asking for "everything from
+// here to EOF". Both of its reads have info.Size in scope, so neither needs the
+// client to discover the object length.
+func TestFetchPageIndex_RequestsBoundedRanges(t *testing.T) {
+	// Build a real LTX file so the page index footer parses and the second,
+	// larger read is actually taken.
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:  ltx.Version,
+		Flags:    ltx.HeaderFlagNoChecksum,
+		PageSize: 4096,
+		Commit:   1,
+		MinTXID:  1,
+		MaxTXID:  1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodePage(ltx.PageHeader{Pgno: 1}, make([]byte, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data := buf.Bytes()
+
+	type openArgs struct{ offset, size int64 }
+	var opens []openArgs
+
+	client := &mock.ReplicaClient{
+		OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			opens = append(opens, openArgs{offset, size})
+			if offset > int64(len(data)) {
+				return nil, fmt.Errorf("offset %d past end of object (%d)", offset, len(data))
+			}
+			end := int64(len(data))
+			if size > 0 && offset+size < end {
+				end = offset + size
+			}
+			return io.NopCloser(bytes.NewReader(data[offset:end])), nil
+		},
+	}
+
+	if _, err := litestream.FetchPageIndex(context.Background(), client, &ltx.FileInfo{
+		Level:   0,
+		MinTXID: 1,
+		MaxTXID: 1,
+		Size:    int64(len(data)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(opens) == 0 {
+		t.Fatal("expected at least one open")
+	}
+	for i, got := range opens {
+		if got.size == 0 {
+			t.Errorf("open %d (offset=%d) passed size 0; info.Size was in scope", i, got.offset)
+			continue
+		}
+		// Every read here runs to the end of the object, so the requested size
+		// must be exactly the remainder.
+		if want := int64(len(data)) - got.offset; got.size != want {
+			t.Errorf("open %d (offset=%d): size=%d, want %d", i, got.offset, got.size, want)
+		}
+	}
+}
