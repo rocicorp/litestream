@@ -401,9 +401,10 @@ func TestOpenLTXFile_MultipartPoolSaturated(t *testing.T) {
 		t.Fatalf("registered readers = %d, want 2", r)
 	}
 
-	// The third reader is a plain stream: probe + fallback GET, no more.
-	if gets, _ := servers[2].stats(); gets != 2 {
-		t.Fatalf("fallback reader made %d GETs, want 2", gets)
+	// The third reader could not register, but it keeps the part already in
+	// flight: one GET so far, and the continuation only once that is drained.
+	if gets, _ := servers[2].stats(); gets != 1 {
+		t.Fatalf("fallback reader made %d GETs before reading, want 1", gets)
 	}
 
 	for i := range 3 {
@@ -747,32 +748,75 @@ func TestNewReplicaClientFromURL_DownloadOptions(t *testing.T) {
 	})
 }
 
-// TestOpenLTXFile_MultipartOversizedRequest verifies a caller asking for more
-// bytes than the object holds gets the object, not a range error. A single
-// ranged GET clamps silently, so the multipart planner must clamp too.
+// TestOpenLTXFile_MultipartOversizedRequest verifies that a caller asking for
+// more bytes than the object holds fails loudly.
+//
+// Callers take the size from the replica listing and LTX files are immutable,
+// so an overrun means the listing and the object disagree. Clamping would hand
+// back known-incomplete LTX data and resurface as an unrelated decode error
+// somewhere downstream; see docs/PATTERNS.md on returning errors that affect
+// correctness.
 func TestOpenLTXFile_MultipartOversizedRequest(t *testing.T) {
 	const (
 		partSize = 1024
 		size     = 10000
 	)
 
-	rs, server := newRangeServer(t, size)
-	client, _ := newMultipartTestClient(t, server, 6, partSize)
+	_, server := newRangeServer(t, size)
+	client, pool := newMultipartTestClient(t, server, 6, partSize)
 
 	rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size*4)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		_ = rc.Close()
+		t.Fatal("expected an error when more bytes are requested than the object holds")
 	}
-	got, err := io.ReadAll(rc)
-	if err != nil {
-		t.Fatal(err)
+	for _, want := range []string{"requested 40000 bytes", "offset 0", "object holds 10000"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not mention %q", err, want)
+		}
 	}
-	if err := rc.Close(); err != nil {
-		t.Fatal(err)
+	if r, _, allocated, _ := poolStats(pool); r != 0 || allocated != 0 {
+		t.Fatalf("pool touched on the failure path: readers=%d allocated=%d", r, allocated)
 	}
+}
 
-	if !bytes.Equal(got, rs.data) {
-		t.Fatalf("got %d bytes, want %d", len(got), len(rs.data))
+// TestOpenLTXFile_DownloadConcurrencyBelowMinimum verifies that a pool too small
+// to seat a single reader is treated as disabled, rather than making every large
+// read pay for a part-sized probe it can never use.
+func TestOpenLTXFile_DownloadConcurrencyBelowMinimum(t *testing.T) {
+	const (
+		partSize = 1024
+		size     = 20000
+	)
+
+	for _, concurrency := range []int{0, 1} {
+		t.Run(strconv.Itoa(concurrency), func(t *testing.T) {
+			rs, server := newRangeServer(t, size)
+
+			client := newTestReplicaClient(t, server)
+			client.DownloadPartSize = partSize
+			client.DownloadConcurrency = concurrency
+
+			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(rc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := rc.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if !bytes.Equal(got, rs.data) {
+				t.Fatalf("got %d bytes, want %d", len(got), len(rs.data))
+			}
+			gets, starts := rs.stats()
+			if gets != 1 {
+				t.Fatalf("GET count = %d, want 1 (multipart disabled, no probe): %v", gets, starts)
+			}
+		})
 	}
 }
 

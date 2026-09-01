@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
@@ -4084,4 +4085,48 @@ dbs:
 			t.Errorf("DownloadConcurrency = %d, want %d", got, want)
 		}
 	})
+}
+
+// TestS3ReplicaConfig_DownloadValidation verifies the YAML form rejects the same
+// values the URL form rejects, rather than silently reverting to the default or
+// silently disabling multipart.
+func TestS3ReplicaConfig_DownloadValidation(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		setting string
+		wantErr string
+	}{
+		{name: "ZeroPartSize", setting: "download-part-size: 0", wantErr: "download-part-size must be a positive integer"},
+		{name: "NegativePartSize", setting: "download-part-size: -1", wantErr: "download-part-size must be a positive integer"},
+		{name: "NegativeConcurrency", setting: "download-concurrency: -1", wantErr: "download-concurrency must not be negative"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			filename := filepath.Join(t.TempDir(), "litestream.yml")
+			config := fmt.Sprintf(`
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+        %s
+`[1:], tt.setting)
+			if err := os.WriteFile(filename, []byte(config), 0666); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, err := main.ReadConfigFile(filename, false)
+			if err != nil {
+				// Some values are rejected while unmarshalling; that is fine as
+				// long as the failure is reported rather than swallowed.
+				return
+			}
+			if _, err := main.NewReplicaFromConfig(cfg.DBs[0].Replicas[0], nil); err == nil {
+				t.Fatal("expected a configuration error")
+			} else if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error %q does not mention %q", err, tt.wantErr)
+			}
+		})
+	}
 }

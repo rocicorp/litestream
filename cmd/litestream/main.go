@@ -1708,10 +1708,20 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	if udownloadConcurrencySet {
 		client.DownloadConcurrency = int(udownloadConcurrency)
 	}
+	// Validate before assigning so the YAML and URL forms share one contract:
+	// an out-of-range value is a configuration error, not a silent revert to the
+	// default (part size) or a silent disable (concurrency).
 	if c.DownloadPartSize != nil {
-		client.DownloadPartSize = int64(*c.DownloadPartSize)
+		v := int64(*c.DownloadPartSize)
+		if v <= 0 {
+			return nil, fmt.Errorf("download-part-size must be a positive integer, got %d", v)
+		}
+		client.DownloadPartSize = v
 	}
 	if c.DownloadConcurrency != nil {
+		if *c.DownloadConcurrency < 0 {
+			return nil, fmt.Errorf("download-concurrency must not be negative, got %d", *c.DownloadConcurrency)
+		}
 		client.DownloadConcurrency = *c.DownloadConcurrency
 	}
 

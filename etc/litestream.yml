@@ -47,7 +47,8 @@
 #      # in parallel. download-concurrency is the size of a chunk buffer pool
 #      # shared by every download in the process, not a per-file limit, so up to
 #      # download-concurrency * download-part-size bytes may be buffered. Set
-#      # download-concurrency to 0 to disable multipart downloads.
+#      # download-concurrency to 0 to disable multipart downloads; a value
+#      # below 2 cannot seat a reader and is treated the same way.
 #      download-part-size:   16MiB         # default: 16MiB
 #      download-concurrency: 48            # default: 48
 

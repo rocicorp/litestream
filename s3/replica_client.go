@@ -759,16 +759,16 @@ func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size 
 	case size > 0:
 		total = size
 
-		// Never plan past the end of the object. Callers derive the size from
-		// the replica listing and LTX files are immutable, so asking for more
-		// than exists means the listing and the object disagree -- a truncated
-		// upload, or a stale index. Clamp, as a single ranged GET and every
-		// other backend would, but say so: otherwise the mismatch resurfaces as
-		// a confusing LTX decode failure much further downstream.
+		// Callers derive the size from the replica listing and LTX files are
+		// immutable, so asking for more than exists means the listing and the
+		// object disagree -- a truncated upload, or a stale index. Serving the
+		// short read would hand the caller known-incomplete LTX data and
+		// resurface as an unrelated decode failure further downstream, so fail
+		// here where the cause is still visible.
 		if haveRemaining && remaining < total {
-			c.logger.Debug("requested size exceeds object length",
-				"key", key, "offset", offset, "requested", size, "available", remaining)
-			total = remaining
+			_ = out.Body.Close()
+			return nil, fmt.Errorf("s3: %s: requested %d bytes at offset %d but object holds %d",
+				key, size, offset, remaining)
 		}
 
 	case haveRemaining:
@@ -798,14 +798,19 @@ func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size 
 	}
 
 	// A saturated pool falls back to a single stream instead of waiting, so a
-	// reader can never be blocked by its peers. See minReaderChunks.
+	// reader can never be blocked by its peers. See minReaderChunks. The part
+	// already in flight is still good data, so continue from it rather than
+	// discarding it and re-reading from the start.
 	lease := pool.register()
 	if lease == nil {
-		_ = out.Body.Close()
-		if out, err = c.getObject(ctx, key, offset, size); err != nil {
-			return nil, err
-		}
-		return out.Body, nil
+		return &continuationReader{
+			c:        c,
+			ctx:      ctx,
+			key:      key,
+			rc:       out.Body,
+			nextOff:  offset + partSize,
+			nextSize: total - partSize,
+		}, nil
 	}
 
 	c.logger.Debug("downloading in parallel parts",
@@ -825,7 +830,9 @@ func (c *ReplicaClient) downloadPartSize() int64 {
 // downloadPool returns the chunk pool for this client, or nil if multipart
 // downloads are disabled.
 func (c *ReplicaClient) downloadPool() *chunkPool {
-	if c.DownloadConcurrency <= 0 {
+	// A pool that cannot seat even one reader would make every large read pay
+	// for a part-sized probe and then fall back, so treat it as disabled.
+	if c.DownloadConcurrency < minReaderChunks {
 		return nil
 	}
 	if c.pool != nil {

@@ -1,4 +1,4 @@
-//go:build integration && docker
+//go:build integration
 
 package integration
 

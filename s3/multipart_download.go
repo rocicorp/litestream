@@ -555,8 +555,9 @@ type continuationReader struct {
 	ctx context.Context
 	key string
 
-	rc      io.ReadCloser
-	nextOff int64 // start of the continuation; negative once it has been opened
+	rc       io.ReadCloser
+	nextOff  int64 // start of the continuation; negative once it has been opened
+	nextSize int64 // length of the continuation; zero reads to the end of the object
 }
 
 func (r *continuationReader) Read(p []byte) (int, error) {
@@ -582,7 +583,7 @@ func (r *continuationReader) Read(p []byte) (int, error) {
 		off := r.nextOff
 		r.nextOff = -1
 
-		rc, err := r.c.getRange(r.ctx, r.key, off, 0)
+		rc, err := r.c.getRange(r.ctx, r.key, off, r.nextSize)
 		if err != nil {
 			if isRangeNotSatisfiable(err) {
 				// Nothing follows: the object ended on the part boundary.

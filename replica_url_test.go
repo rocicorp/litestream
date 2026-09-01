@@ -1,6 +1,8 @@
 package litestream_test
 
 import (
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
@@ -1333,6 +1335,72 @@ func TestS3ProviderDefaults_QueryParamOverrides(t *testing.T) {
 		s3Client := client.(*s3.ReplicaClient)
 		if s3Client.RequireContentMD5 != true {
 			t.Errorf("RequireContentMD5 = %v, want true (explicit override)", s3Client.RequireContentMD5)
+		}
+	})
+}
+
+// TestNonNegativeIntQueryValue covers the branch that distinguishes this helper
+// from IntQueryValue: zero is a meaningful value (it disables a feature) while
+// negative and malformed values are still errors.
+func TestNonNegativeIntQueryValue(t *testing.T) {
+	t.Run("Zero", func(t *testing.T) {
+		v, ok, err := litestream.NonNegativeIntQueryValue(url.Values{"n": []string{"0"}}, "n")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !ok || v != 0 {
+			t.Fatalf("got (%d, %v), want (0, true)", v, ok)
+		}
+	})
+
+	t.Run("Positive", func(t *testing.T) {
+		v, ok, err := litestream.NonNegativeIntQueryValue(url.Values{"n": []string{"48"}}, "n")
+		if err != nil || !ok || v != 48 {
+			t.Fatalf("got (%d, %v, %v), want (48, true, nil)", v, ok, err)
+		}
+	})
+
+	t.Run("Negative", func(t *testing.T) {
+		// The difference from IntQueryValue: -1 is rejected, 0 is not.
+		if _, _, err := litestream.NonNegativeIntQueryValue(url.Values{"n": []string{"-1"}}, "n"); err == nil {
+			t.Fatal("expected an error for a negative value")
+		} else if !strings.Contains(err.Error(), "non-negative") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("Malformed", func(t *testing.T) {
+		if _, _, err := litestream.NonNegativeIntQueryValue(url.Values{"n": []string{"abc"}}, "n"); err == nil {
+			t.Fatal("expected an error for a malformed value")
+		}
+	})
+
+	t.Run("Missing", func(t *testing.T) {
+		v, ok, err := litestream.NonNegativeIntQueryValue(url.Values{"other": []string{"1"}}, "n")
+		if err != nil || ok || v != 0 {
+			t.Fatalf("got (%d, %v, %v), want (0, false, nil)", v, ok, err)
+		}
+	})
+
+	t.Run("NilQuery", func(t *testing.T) {
+		v, ok, err := litestream.NonNegativeIntQueryValue(nil, "n")
+		if err != nil || ok || v != 0 {
+			t.Fatalf("got (%d, %v, %v), want (0, false, nil)", v, ok, err)
+		}
+	})
+
+	t.Run("Aliases", func(t *testing.T) {
+		q := url.Values{"download-concurrency": []string{"0"}}
+		v, ok, err := litestream.NonNegativeIntQueryValue(q, "downloadConcurrency", "download-concurrency")
+		if err != nil || !ok || v != 0 {
+			t.Fatalf("got (%d, %v, %v), want (0, true, nil)", v, ok, err)
+		}
+	})
+
+	t.Run("EmptyValueIsAbsent", func(t *testing.T) {
+		v, ok, err := litestream.NonNegativeIntQueryValue(url.Values{"n": []string{""}}, "n")
+		if err != nil || ok || v != 0 {
+			t.Fatalf("got (%d, %v, %v), want (0, false, nil)", v, ok, err)
 		}
 	})
 }
