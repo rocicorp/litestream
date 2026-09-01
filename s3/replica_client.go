@@ -110,6 +110,18 @@ type ReplicaClient struct {
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
 	Concurrency int   // Number of concurrent parts to upload (default: 5)
 
+	// Download configuration. These are independent of PartSize/Concurrency:
+	// the upload settings carry provider-specific overrides (e.g. R2 caps
+	// concurrency at 2) that would needlessly throttle reads.
+	//
+	// DownloadConcurrency is the size of the process-wide chunk buffer pool,
+	// not a per-file limit. Set it to zero to disable multipart downloads.
+	DownloadPartSize    int64
+	DownloadConcurrency int
+
+	// pool overrides the process-wide chunk pool. Only set by tests.
+	pool *chunkPool
+
 	// MetadataConcurrency controls parallel HeadObject calls for timestamp-based restore.
 	// Higher values improve restore speed for large backup histories.
 	// Default: 50 (S3 can handle 5,500+ HEAD/s per prefix)
@@ -129,10 +141,12 @@ type ReplicaClient struct {
 // NewReplicaClient returns a new instance of ReplicaClient.
 func NewReplicaClient() *ReplicaClient {
 	return &ReplicaClient{
-		logger:             slog.Default().WithGroup(ReplicaClientType),
-		RequireContentMD5:  true,
-		SignPayload:        true,
-		SignAcceptEncoding: true,
+		logger:              slog.Default().WithGroup(ReplicaClientType),
+		RequireContentMD5:   true,
+		SignPayload:         true,
+		SignAcceptEncoding:  true,
+		DownloadPartSize:    DefaultDownloadPartSize,
+		DownloadConcurrency: DefaultDownloadConcurrency,
 	}
 }
 
@@ -146,21 +160,24 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	client := NewReplicaClient()
 
 	var (
-		bucket                string
-		region                string
-		endpoint              string
-		forcePathStyle        bool
-		skipVerify            bool
-		signPayload           bool
-		signPayloadSet        bool
-		signAcceptEncoding    bool
-		signAcceptEncodingSet bool
-		requireMD5            bool
-		requireMD5Set         bool
-		concurrency           int
-		concurrencySet        bool
-		partSize              int64
-		storageClass          string
+		bucket                 string
+		region                 string
+		endpoint               string
+		forcePathStyle         bool
+		skipVerify             bool
+		signPayload            bool
+		signPayloadSet         bool
+		signAcceptEncoding     bool
+		signAcceptEncodingSet  bool
+		requireMD5             bool
+		requireMD5Set          bool
+		concurrency            int
+		concurrencySet         bool
+		partSize               int64
+		storageClass           string
+		downloadConcurrency    int
+		downloadConcurrencySet bool
+		downloadPartSize       int64
 	)
 
 	// Parse host for bucket and region
@@ -212,6 +229,17 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		return nil, err
 	} else if ok {
 		partSize = v
+	}
+	if v, ok, err := litestream.NonNegativeIntQueryValue(query, "downloadConcurrency", "download-concurrency"); err != nil {
+		return nil, err
+	} else if ok {
+		downloadConcurrency = int(v)
+		downloadConcurrencySet = true
+	}
+	if v, ok, err := litestream.IntQueryValue(query, "downloadPartSize", "download-part-size"); err != nil {
+		return nil, err
+	} else if ok {
+		downloadPartSize = v
 	}
 	if v := query.Get("storageClass"); v != "" {
 		storageClass = v
@@ -313,6 +341,12 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	}
 	if partSize > 0 {
 		client.PartSize = partSize
+	}
+	if downloadConcurrencySet {
+		client.DownloadConcurrency = downloadConcurrency
+	}
+	if downloadPartSize > 0 {
+		client.DownloadPartSize = downloadPartSize
 	}
 	client.StorageClass = storageClass
 
@@ -671,21 +705,132 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 
 // OpenLTXFile returns a reader for an LTX file
 // Returns os.ErrNotExist if no matching index/offset is found.
+//
+// Files larger than the download part size are fetched as several ranged GETs
+// in parallel; see openRange.
 func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
 
+	// Build the key from the file info
+	filename := ltx.FormatFilename(minTXID, maxTXID)
+	key := c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)
+
+	return c.openRange(ctx, key, offset, size)
+}
+
+// openRange returns a reader over [offset, offset+size) of key, or to the end of
+// the object when size is zero.
+//
+// The first part-sized GET doubles as a size probe. It is chunk 0 of the
+// download either way, so learning the object size costs nothing: a small object
+// comes back whole and is returned as-is -- exactly one GET, no pool buffers, no
+// HEAD -- and only an object spanning more than one part is upgraded to a
+// parallel multipart read.
+func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size int64) (io.ReadCloser, error) {
+	pool := c.downloadPool()
+
+	// Multipart disabled, or the caller already told us it fits in one part.
+	if pool == nil || (size > 0 && size <= pool.partSize) {
+		out, err := c.getObject(ctx, key, offset, size)
+		if err != nil {
+			return nil, err
+		}
+		return out.Body, nil
+	}
+
+	// The pool owns the part size: its buffers must be able to hold a whole
+	// chunk, so the chunk size cannot be varied per client.
+	partSize := pool.partSize
+
+	out, err := c.getObject(ctx, key, offset, partSize)
+	if err != nil {
+		return nil, err
+	}
+
+	remaining, haveRemaining := remainingFromContentRange(aws.ToString(out.ContentRange), offset)
+	if !haveRemaining && size <= 0 {
+		// The provider omitted Content-Range, so the response length is the only
+		// signal we have. A short body means the object ended inside the first
+		// part; a full-length body may have been truncated by our own range, so
+		// re-issue the read without one.
+		if aws.ToInt64(out.ContentLength) < partSize {
+			return out.Body, nil
+		}
+		_ = out.Body.Close()
+		if out, err = c.getObject(ctx, key, offset, size); err != nil {
+			return nil, err
+		}
+		return out.Body, nil
+	}
+
+	// Never plan past the end of the object: a caller may ask for more bytes
+	// than remain, which a single ranged GET would silently clamp.
+	total := size
+	if total <= 0 || (haveRemaining && remaining < total) {
+		total = remaining
+	}
+
+	if total <= partSize {
+		return out.Body, nil
+	}
+
+	// A saturated pool falls back to a single stream instead of waiting, so a
+	// reader can never be blocked by its peers. See minReaderChunks.
+	lease := pool.register()
+	if lease == nil {
+		_ = out.Body.Close()
+		if out, err = c.getObject(ctx, key, offset, size); err != nil {
+			return nil, err
+		}
+		return out.Body, nil
+	}
+
+	c.logger.Debug("downloading in parallel parts",
+		"key", key, "offset", offset, "size", total, "part-size", partSize)
+
+	return newMultipartReader(ctx, c, key, out.Body, offset, total, partSize, lease), nil
+}
+
+// downloadPartSize returns the size of each parallel download chunk.
+func (c *ReplicaClient) downloadPartSize() int64 {
+	if c.DownloadPartSize > 0 {
+		return c.DownloadPartSize
+	}
+	return DefaultDownloadPartSize
+}
+
+// downloadPool returns the chunk pool for this client, or nil if multipart
+// downloads are disabled.
+func (c *ReplicaClient) downloadPool() *chunkPool {
+	if c.DownloadConcurrency <= 0 {
+		return nil
+	}
+	if c.pool != nil {
+		return c.pool
+	}
+
+	pool := sharedChunkPool(c.DownloadConcurrency, c.downloadPartSize())
+	if pool.size != c.DownloadConcurrency || pool.partSize != c.downloadPartSize() {
+		// Another replica established the pool first. Downloads still work, so
+		// this is only worth reporting for diagnosis.
+		c.logger.Debug("using established download pool geometry",
+			"pool-concurrency", pool.size, "pool-part-size", pool.partSize,
+			"requested-concurrency", c.DownloadConcurrency, "requested-part-size", c.downloadPartSize())
+	}
+	return pool
+}
+
+// getObjectInput builds a ranged GetObject request for key. A size of zero reads
+// to the end of the object.
+func (c *ReplicaClient) getObjectInput(key string, offset, size int64) *s3.GetObjectInput {
 	var rangeStr string
 	if size > 0 {
 		rangeStr = fmt.Sprintf("bytes=%d-%d", offset, offset+size-1)
 	} else {
 		rangeStr = fmt.Sprintf("bytes=%d-", offset)
 	}
-
-	// Build the key from the file info
-	filename := ltx.FormatFilename(minTXID, maxTXID)
-	key := c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)
 
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
@@ -700,15 +845,45 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 		input.SSECustomerKey = aws.String(c.SSECustomerKey)
 		input.SSECustomerKeyMD5 = aws.String(c.SSECustomerKeyMD5)
 	}
+	return input
+}
 
-	out, err := c.s3.GetObject(ctx, input)
+// getObject issues a ranged GET and records it against the operation metrics.
+func (c *ReplicaClient) getObject(ctx context.Context, key string, offset, size int64) (*s3.GetObjectOutput, error) {
+	out, err := c.s3.GetObject(ctx, c.getObjectInput(key, offset, size))
 	if err != nil {
 		if isNotExists(err) {
 			return nil, os.ErrNotExist
 		}
 		return nil, fmt.Errorf("s3: get object %s: %w", key, err)
 	}
+	recordGet(aws.ToInt64(out.ContentLength))
+	return out, nil
+}
+
+// getRange returns the body of a ranged GET.
+func (c *ReplicaClient) getRange(ctx context.Context, key string, offset, size int64) (io.ReadCloser, error) {
+	out, err := c.getObject(ctx, key, offset, size)
+	if err != nil {
+		return nil, err
+	}
 	return out.Body, nil
+}
+
+// readRange fills buf from [offset, offset+size) of key. It returns the number
+// of bytes read, which is short only when the request or the body failed.
+func (c *ReplicaClient) readRange(ctx context.Context, key string, offset, size int64, buf []byte) (int64, error) {
+	rc, err := c.getRange(ctx, key, offset, size)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = rc.Close() }()
+
+	n, err := io.ReadFull(rc, buf)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		err = io.ErrUnexpectedEOF
+	}
+	return int64(n), err
 }
 
 // WriteLTXFile writes an LTX file to the replica.

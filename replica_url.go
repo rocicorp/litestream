@@ -227,6 +227,25 @@ func IntQueryValue(query url.Values, keys ...string) (value int64, ok bool, err 
 	return 0, false, nil
 }
 
+// NonNegativeIntQueryValue is IntQueryValue for settings where zero is a
+// meaningful value rather than "unset", such as a concurrency that disables a
+// feature when set to zero.
+func NonNegativeIntQueryValue(query url.Values, keys ...string) (value int64, ok bool, err error) {
+	if query == nil {
+		return 0, false, nil
+	}
+	for _, key := range keys {
+		if raw := query.Get(key); raw != "" {
+			n, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || n < 0 {
+				return 0, false, fmt.Errorf("invalid value for query parameter %q: %q (must be a non-negative integer)", key, raw)
+			}
+			return n, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
 // IsHetznerEndpoint returns true if the endpoint is Hetzner object storage service.
 func IsHetznerEndpoint(endpoint string) bool {
 	host := extractEndpointHost(endpoint)

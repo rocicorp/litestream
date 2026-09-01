@@ -1138,6 +1138,12 @@ type ReplicaSettings struct {
 	PartSize           *ByteSize `yaml:"part-size"`
 	Concurrency        *int      `yaml:"concurrency"`
 
+	// Multipart download settings. Independent of part-size/concurrency, which
+	// configure uploads. Set download-concurrency to 0 to disable multipart
+	// downloads.
+	DownloadPartSize    *ByteSize `yaml:"download-part-size"`
+	DownloadConcurrency *int      `yaml:"download-concurrency"`
+
 	// S3 Server-Side Encryption (SSE-C: Customer-provided keys)
 	SSECustomerAlgorithm string `yaml:"sse-customer-algorithm"`
 	SSECustomerKey       string `yaml:"sse-customer-key"`
@@ -1483,18 +1489,22 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	// Apply settings from URL, if specified.
 	var (
-		endpointWasSet         bool
-		usignPayload           bool
-		usignPayloadSet        bool
-		usignAcceptEncoding    bool
-		usignAcceptEncodingSet bool
-		urequireContentMD5     bool
-		urequireContentMD5Set  bool
-		ustorageClass          string
-		upartSize              int64
-		upartSizeSet           bool
-		uconcurrency           int64
-		uconcurrencySet        bool
+		endpointWasSet          bool
+		usignPayload            bool
+		usignPayloadSet         bool
+		usignAcceptEncoding     bool
+		usignAcceptEncodingSet  bool
+		urequireContentMD5      bool
+		urequireContentMD5Set   bool
+		ustorageClass           string
+		upartSize               int64
+		upartSizeSet            bool
+		uconcurrency            int64
+		uconcurrencySet         bool
+		udownloadPartSize       int64
+		udownloadPartSizeSet    bool
+		udownloadConcurrency    int64
+		udownloadConcurrencySet bool
 	)
 	if endpoint != "" {
 		endpointWasSet = true
@@ -1568,6 +1578,18 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		} else if ok {
 			uconcurrency = v
 			uconcurrencySet = true
+		}
+		if v, ok, err := litestream.IntQueryValue(query, "downloadPartSize", "download-part-size"); err != nil {
+			return nil, err
+		} else if ok {
+			udownloadPartSize = v
+			udownloadPartSizeSet = true
+		}
+		if v, ok, err := litestream.NonNegativeIntQueryValue(query, "downloadConcurrency", "download-concurrency"); err != nil {
+			return nil, err
+		} else if ok {
+			udownloadConcurrency = v
+			udownloadConcurrencySet = true
 		}
 
 		// Only apply URL parts to field that have not been overridden.
@@ -1677,6 +1699,20 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	}
 	if c.Concurrency != nil {
 		client.Concurrency = *c.Concurrency
+	}
+
+	// Apply download configuration from URL query, then config overrides.
+	if udownloadPartSizeSet {
+		client.DownloadPartSize = udownloadPartSize
+	}
+	if udownloadConcurrencySet {
+		client.DownloadConcurrency = int(udownloadConcurrency)
+	}
+	if c.DownloadPartSize != nil {
+		client.DownloadPartSize = int64(*c.DownloadPartSize)
+	}
+	if c.DownloadConcurrency != nil {
+		client.DownloadConcurrency = *c.DownloadConcurrency
 	}
 
 	// Apply SSE-C configuration if specified.

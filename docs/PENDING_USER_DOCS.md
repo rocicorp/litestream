@@ -4,12 +4,13 @@ This file tracks open issues on [benbjohnson/litestream.io](https://github.com/b
 
 ## Open Issues
 
-None right now. The litestream.io issues previously listed here (#240 through #250) are all closed and their docs have shipped.
-
 Add a row when a new Litestream feature lands that still needs user-facing docs on the site:
 
 | Issue | Title | Related Litestream PR | Category |
 |-------|-------|-----------------------|----------|
+| TBD | S3 multipart downloads (`download-part-size`, `download-concurrency`) | this repo | Reference |
+
+The litestream.io issues previously listed here (#240 through #250) are all closed and their docs have shipped.
 
 ## AI Documentation Status
 
