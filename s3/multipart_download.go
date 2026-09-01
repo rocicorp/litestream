@@ -231,10 +231,9 @@ type multipartReader struct {
 	partSize int64
 	lastIdx  int64
 
-	// Chunk 0 state. Only touched by the reading goroutine.
-	live      io.ReadCloser
-	livePos   int64
-	liveTries int
+	// Chunk 0 state. Only touched by the reading goroutine, as is err below.
+	live    io.ReadCloser
+	livePos int64
 
 	mu        sync.Mutex
 	pending   map[int64]*downloadChunk
@@ -311,22 +310,21 @@ func (r *multipartReader) fetch(ch *downloadChunk) {
 		if n > 0 {
 			tries = 0 // forward progress
 		}
-		if r.ctx.Err() != nil {
-			ch.err = fmt.Errorf("s3: download part %d of %s: %w", ch.idx, r.key, r.ctx.Err())
-			return
+		if err == nil {
+			err = io.ErrUnexpectedEOF
 		}
-		if errors.Is(err, os.ErrNotExist) {
-			ch.err = err
-			return
-		}
-		if tries++; tries > downloadPartRetries {
-			if err == nil {
-				err = io.ErrUnexpectedEOF
-			}
+		if tries++; !r.retryable(err) || tries > downloadPartRetries {
 			ch.err = fmt.Errorf("s3: download part %d of %s at offset %d: %w", ch.idx, r.key, start+off, err)
 			return
 		}
 	}
+}
+
+// retryable reports whether another attempt at the same offset could succeed.
+// A cancelled context or a missing object never recovers; anything else is
+// treated as a transient stream failure.
+func (r *multipartReader) retryable(err error) bool {
+	return r.ctx.Err() == nil && !errors.Is(err, os.ErrNotExist)
 }
 
 func (r *multipartReader) Read(p []byte) (int, error) {
@@ -402,8 +400,19 @@ func (r *multipartReader) retire() {
 }
 
 // readLive serves chunk 0 from its live response body, reconnecting from the
-// current offset if the stream breaks.
+// current offset if the stream breaks. Returning (0, nil) means chunk 0 has been
+// delivered in full and the pooled chunks take over.
+//
+// The retry budget is a local: it counts consecutive failures at one offset, and
+// any read that returns bytes returns from the function, so the next call starts
+// it over. A stream that drops repeatedly but keeps advancing is never limited.
 func (r *multipartReader) readLive(p []byte) (int, error) {
+	fail := func(err error) error {
+		r.err = fmt.Errorf("s3: download part 0 of %s at offset %d: %w", r.key, r.base+r.livePos, err)
+		return r.err
+	}
+
+	var tries int
 	for {
 		remain := r.partSize - r.livePos
 		if remain <= 0 {
@@ -416,8 +425,8 @@ func (r *multipartReader) readLive(p []byte) (int, error) {
 		if r.live == nil {
 			rc, err := r.c.getRange(r.ctx, r.key, r.base+r.livePos, remain)
 			if err != nil {
-				if failed := r.liveFailed(err); failed != nil {
-					return 0, failed
+				if tries++; !r.retryable(err) || tries > downloadPartRetries {
+					return 0, fail(err)
 				}
 				continue
 			}
@@ -426,61 +435,25 @@ func (r *multipartReader) readLive(p []byte) (int, error) {
 
 		n, err := r.live.Read(p)
 		r.livePos += int64(n)
-		if n > 0 {
-			r.liveTries = 0
-		}
-		if r.livePos >= r.partSize {
+		if err != nil || r.livePos >= r.partSize {
+			// Either chunk 0 is complete or the stream broke; drop it so the
+			// next attempt reopens from the current offset.
 			r.closeLive()
 		}
 
-		if err == nil || (err == io.EOF && r.livePos >= r.partSize) {
-			if n > 0 {
-				return n, nil
-			}
-			if err != nil {
-				return 0, nil // chunk 0 fully delivered
-			}
-			continue
-		}
-
-		// Broken or prematurely closed stream: resume from the current offset.
-		r.closeLive()
-		failed := r.liveFailed(err)
 		if n > 0 {
 			return n, nil
 		}
-		if failed != nil {
-			return 0, failed
+		switch {
+		case err == nil:
+			continue // a legal empty read, not a failure
+		case err == io.EOF && r.livePos >= r.partSize:
+			return 0, nil // chunk 0 fully delivered
+		}
+		if tries++; !r.retryable(err) || tries > downloadPartRetries {
+			return 0, fail(err)
 		}
 	}
-}
-
-// liveFailed records a chunk 0 failure and returns a terminal error once the
-// retry budget for the current offset is exhausted.
-func (r *multipartReader) liveFailed(err error) error {
-	if r.ctx.Err() != nil || errors.Is(err, os.ErrNotExist) {
-		r.setErr(fmt.Errorf("s3: download part 0 of %s at offset %d: %w", r.key, r.base+r.livePos, err))
-		return r.readErr()
-	}
-	if r.liveTries++; r.liveTries > downloadPartRetries {
-		r.setErr(fmt.Errorf("s3: download part 0 of %s at offset %d: %w", r.key, r.base+r.livePos, err))
-		return r.readErr()
-	}
-	return nil
-}
-
-func (r *multipartReader) setErr(err error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.err == nil {
-		r.err = err
-	}
-}
-
-func (r *multipartReader) readErr() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.err
 }
 
 func (r *multipartReader) closeLive() {

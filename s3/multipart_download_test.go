@@ -36,6 +36,12 @@ type rangeServer struct {
 	// a ranged GET.
 	omitContentRange bool
 
+	// emptyBody answers a given start offset with a well-formed but empty 206,
+	// so the part makes no progress and no transport error occurs. That isolates
+	// the reader's own retry budget from the SDK's transport retryer, which
+	// would otherwise retry an aborted connection ten times with backoff.
+	emptyBody map[int64]bool
+
 	mu     sync.Mutex
 	ranges []int64 // start offset of every request, in arrival order
 	gets   int
@@ -49,7 +55,11 @@ func newRangeServer(t *testing.T, size int) (*rangeServer, *httptest.Server) {
 		t.Fatal(err)
 	}
 
-	rs := &rangeServer{data: data, truncateOnce: make(map[int64]bool)}
+	rs := &rangeServer{
+		data:         data,
+		truncateOnce: make(map[int64]bool),
+		emptyBody:    make(map[int64]bool),
+	}
 	server := httptest.NewServer(http.HandlerFunc(rs.serve))
 	t.Cleanup(server.Close)
 	return rs, server
@@ -80,6 +90,7 @@ func (rs *rangeServer) serve(w http.ResponseWriter, r *http.Request) {
 	if truncate {
 		rs.truncateOnce[start] = false
 	}
+	empty := rs.emptyBody[start]
 	rs.mu.Unlock()
 
 	if rs.delay != nil {
@@ -87,6 +98,9 @@ func (rs *rangeServer) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body := rs.data[start : end+1]
+	if empty {
+		body = nil
+	}
 	w.Header().Set("Accept-Ranges", "bytes")
 	if !rs.omitContentRange {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
@@ -990,4 +1004,65 @@ func TestOpenLTXFile_MultipartSizeFromCaller(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestOpenLTXFile_MultipartRetryBudget verifies that a part which never
+// completes gives up with an error rather than retrying forever. The retry loops
+// reset their budget on forward progress, so an unbounded stream of
+// zero-progress failures is the case that must terminate.
+func TestOpenLTXFile_MultipartRetryBudget(t *testing.T) {
+	const (
+		partSize = 1024
+		size     = 20000
+	)
+
+	for _, name := range []string{"head", "lookahead"} {
+		t.Run(name, func(t *testing.T) {
+			rs, server := newRangeServer(t, size)
+			// "head" starves chunk 0, which streams live; "lookahead" starves a
+			// pooled chunk fetched in the background. Neither can ever finish.
+			broken := int64(0)
+			if name == "lookahead" {
+				broken = 3 * partSize
+			}
+			rs.emptyBody[broken] = true
+
+			client, pool := newMultipartTestClient(t, server, 6, partSize)
+
+			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				_, err := io.ReadAll(rc)
+				done <- err
+			}()
+
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("expected an error once the retry budget is exhausted")
+				}
+				if !strings.Contains(err.Error(), "download part") {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("read did not terminate: the retry budget is not bounded")
+			}
+
+			gets, _ := rs.stats()
+			if gets > 4*downloadPartRetries {
+				t.Fatalf("made %d requests for a part that never progresses; the budget is not binding", gets)
+			}
+
+			if err := rc.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if r, s, allocated, free := poolStats(pool); r != 0 || s != 0 || free != allocated {
+				t.Fatalf("pool not drained after failure: readers=%d surplus=%d free=%d allocated=%d", r, s, free, allocated)
+			}
+		})
+	}
 }
