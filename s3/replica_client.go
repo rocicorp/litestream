@@ -749,12 +749,36 @@ func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size 
 		return nil, err
 	}
 
+	// Work out how many bytes this download covers. The caller's size and the
+	// response's Content-Range are the only two signals; these cases are
+	// exhaustive, so total is never derived from an absent Content-Range.
 	remaining, haveRemaining := remainingFromContentRange(aws.ToString(out.ContentRange), offset)
-	if !haveRemaining && size <= 0 {
-		// The provider omitted Content-Range, so the response length is the only
-		// signal we have. A short body means the object ended inside the first
-		// part; a full-length body may have been truncated by our own range, so
-		// re-issue the read without one.
+
+	var total int64
+	switch {
+	case size > 0:
+		total = size
+
+		// Never plan past the end of the object. Callers derive the size from
+		// the replica listing and LTX files are immutable, so asking for more
+		// than exists means the listing and the object disagree -- a truncated
+		// upload, or a stale index. Clamp, as a single ranged GET and every
+		// other backend would, but say so: otherwise the mismatch resurfaces as
+		// a confusing LTX decode failure much further downstream.
+		if haveRemaining && remaining < total {
+			c.logger.Debug("requested size exceeds object length",
+				"key", key, "offset", offset, "requested", size, "available", remaining)
+			total = remaining
+		}
+
+	case haveRemaining:
+		total = remaining
+
+	default:
+		// Neither signal is available, so there is nothing to plan from. A short
+		// body means the object ended inside the first part; a full-length body
+		// may have been truncated by our own range, so re-issue the read without
+		// one (size is zero here, so this is unbounded).
 		if aws.ToInt64(out.ContentLength) < partSize {
 			return out.Body, nil
 		}
@@ -763,24 +787,6 @@ func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size 
 			return nil, err
 		}
 		return out.Body, nil
-	}
-
-	// Never plan past the end of the object: a caller may ask for more bytes
-	// than remain, which a single ranged GET would silently clamp.
-	total := size
-	if total <= 0 || (haveRemaining && remaining < total) {
-		if size > 0 && haveRemaining {
-			// Callers derive the size from the replica listing and LTX files are
-			// immutable, so asking for more than exists means the listing and
-			// the object disagree -- a truncated upload, or a stale index. The
-			// read is clamped to what a single ranged GET would have returned,
-			// which keeps this consistent with the other backends, but the
-			// mismatch is worth surfacing: it will otherwise resurface as a
-			// confusing LTX decode failure further downstream.
-			c.logger.Debug("requested size exceeds object length",
-				"key", key, "offset", offset, "requested", size, "available", remaining)
-		}
-		total = remaining
 	}
 
 	if total <= partSize {
