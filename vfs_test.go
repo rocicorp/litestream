@@ -17,8 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
+
+	"github.com/psanford/sqlite3vfs"
 )
 
 func TestVFSFile_LockStateMachine(t *testing.T) {
@@ -870,6 +871,8 @@ func (c *countingReplicaClient) DeleteLTXFiles(context.Context, []*ltx.FileInfo)
 
 func (c *countingReplicaClient) DeleteAll(context.Context) error { return nil }
 
+func (c *countingReplicaClient) SetLogger(*slog.Logger) {}
+
 func newMockReplicaClient() *mockReplicaClient {
 	return &mockReplicaClient{data: make(map[string][]byte)}
 }
@@ -936,6 +939,8 @@ func (c *mockReplicaClient) DeleteLTXFiles(context.Context, []*ltx.FileInfo) err
 func (c *mockReplicaClient) DeleteAll(context.Context) error {
 	return fmt.Errorf("not implemented")
 }
+
+func (c *mockReplicaClient) SetLogger(*slog.Logger) {}
 
 func (c *blockingReplicaClient) Type() string { return "blocking" }
 
