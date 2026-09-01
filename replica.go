@@ -944,7 +944,7 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 // randomize the schema change counter (bytes 24-27) to invalidate cached
 // schemas in other connections.
 func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileInfo, pageSize uint32) error {
-	rc, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+	rc, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, info.Size)
 	if err != nil {
 		return fmt.Errorf("open ltx file: %w", err)
 	}
