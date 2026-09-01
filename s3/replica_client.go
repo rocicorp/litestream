@@ -775,18 +775,22 @@ func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size 
 		total = remaining
 
 	default:
-		// Neither signal is available, so there is nothing to plan from. A short
-		// body means the object ended inside the first part; a full-length body
-		// may have been truncated by our own range, so re-issue the read without
-		// one (size is zero here, so this is unbounded).
+		// The provider omitted Content-Range, so the length is unknown and the
+		// download cannot be planned. A short body means the object ended inside
+		// the first part. A full-length one is ambiguous -- the object may
+		// continue, or may have ended exactly on the part boundary -- but that
+		// is settled by asking for what follows rather than by re-reading what
+		// we already hold: data means there was more, 416 means there was not.
 		if aws.ToInt64(out.ContentLength) < partSize {
 			return out.Body, nil
 		}
-		_ = out.Body.Close()
-		if out, err = c.getObject(ctx, key, offset, size); err != nil {
-			return nil, err
-		}
-		return out.Body, nil
+		return &continuationReader{
+			c:       c,
+			ctx:     ctx,
+			key:     key,
+			rc:      out.Body,
+			nextOff: offset + partSize,
+		}, nil
 	}
 
 	if total <= partSize {
@@ -2028,6 +2032,24 @@ var (
 	filebaseRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.filebase.com$`)
 	scalewayRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.scw\.cloud$`)
 )
+
+// isRangeNotSatisfiable reports whether err is a 416 from a range request that
+// starts at or past the end of the object.
+func isRangeNotSatisfiable(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "InvalidRange", "RequestedRangeNotSatisfiable":
+			return true
+		}
+	}
+
+	var respErr *smithyhttp.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable
+	}
+	return false
+}
 
 func isNotExists(err error) bool {
 	var apiErr smithy.APIError

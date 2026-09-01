@@ -61,6 +61,12 @@ func (rs *rangeServer) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Count every GET the server receives, including ones it answers with 416:
+	// a request that reports the end of the object is still a request.
+	rs.mu.Lock()
+	rs.gets++
+	rs.mu.Unlock()
+
 	total := int64(len(rs.data))
 	start, end, err := parseRangeHeader(r.Header.Get("Range"), total)
 	if err != nil {
@@ -69,7 +75,6 @@ func (rs *rangeServer) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rs.mu.Lock()
-	rs.gets++
 	rs.ranges = append(rs.ranges, start)
 	truncate := rs.truncateOnce[start]
 	if truncate {
@@ -853,7 +858,7 @@ func TestOpenLTXFile_MultipartSizeFromCaller(t *testing.T) {
 		}
 	})
 
-	t.Run("SizeUnknownFallsBackToSingleStream", func(t *testing.T) {
+	t.Run("SizeUnknownContinuesRatherThanRefetching", func(t *testing.T) {
 		rs, server := newRangeServer(t, size)
 		rs.omitContentRange = true
 
@@ -874,14 +879,71 @@ func TestOpenLTXFile_MultipartSizeFromCaller(t *testing.T) {
 		if !bytes.Equal(got, rs.data) {
 			t.Fatalf("got %d bytes, want %d", len(got), len(rs.data))
 		}
-		// Without Content-Range and without a caller-supplied size there is
-		// nothing to plan from: the probe is discarded and the read is retried
-		// unbounded, costing one extra GET.
-		if gets, _ := rs.stats(); gets != 2 {
-			t.Fatalf("GET count = %d, want 2 (probe + unbounded retry)", gets)
+
+		// Without Content-Range there is no length to plan a parallel download
+		// from, but the part already in flight is still good data: the read
+		// continues from where it stopped instead of starting over.
+		gets, starts := rs.stats()
+		if gets != 2 {
+			t.Fatalf("GET count = %d, want 2 (first part + continuation): %v", gets, starts)
+		}
+		if want := []int64{0, partSize}; starts[0] != want[0] || starts[1] != want[1] {
+			t.Fatalf("request offsets = %v, want %v -- the first part must not be re-fetched", starts, want)
 		}
 		if r, _, allocated, _ := poolStats(pool); r != 0 || allocated != 0 {
-			t.Fatalf("pool used on the fallback path: readers=%d allocated=%d", r, allocated)
+			t.Fatalf("pool used on the unplanned path: readers=%d allocated=%d", r, allocated)
+		}
+	})
+
+	// An object whose length is an exact multiple of the part size is the
+	// ambiguous case: the first response is full-length, but the object may or
+	// may not continue. The continuation settles it either way, and because it
+	// is unbounded it costs the same two requests regardless -- what differs is
+	// whether the second returns data or 416.
+	t.Run("SizeUnknownExactPartBoundary", func(t *testing.T) {
+		for _, tt := range []struct {
+			parts      int
+			wantStarts []int64 // a 416 records no start
+		}{
+			{parts: 1, wantStarts: []int64{0}},           // nothing follows: 416
+			{parts: 2, wantStarts: []int64{0, partSize}}, // continues to EOF
+			{parts: 5, wantStarts: []int64{0, partSize}},
+		} {
+			t.Run(strconv.Itoa(tt.parts), func(t *testing.T) {
+				rs, server := newRangeServer(t, tt.parts*partSize)
+				rs.omitContentRange = true
+
+				client, _ := newMultipartTestClient(t, server, 6, partSize)
+
+				rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := io.ReadAll(rc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := rc.Close(); err != nil {
+					t.Fatal(err)
+				}
+
+				if !bytes.Equal(got, rs.data) {
+					t.Fatalf("got %d bytes, want %d", len(got), len(rs.data))
+				}
+
+				gets, starts := rs.stats()
+				if gets != 2 {
+					t.Fatalf("GET count = %d, want 2 (first part + continuation): %v", gets, starts)
+				}
+				if len(starts) != len(tt.wantStarts) {
+					t.Fatalf("served ranges = %v, want %v", starts, tt.wantStarts)
+				}
+				for i := range starts {
+					if starts[i] != tt.wantStarts[i] {
+						t.Fatalf("served ranges = %v, want %v", starts, tt.wantStarts)
+					}
+				}
+			})
 		}
 	})
 }

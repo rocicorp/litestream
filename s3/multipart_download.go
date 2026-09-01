@@ -541,3 +541,62 @@ func recordGet(n int64) {
 		internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(n))
 	}
 }
+
+// continuationReader serves one body and then continues from the byte that
+// follows it, opening the continuation only once the first body is drained.
+//
+// It exists for providers that omit Content-Range on a ranged GET. The object
+// length is unknown, so a parallel download cannot be planned, but the part
+// already in flight is still valid data and must not be thrown away. Whether
+// anything follows it is answered by the continuation itself: bytes mean the
+// object continues, and 416 means it ended exactly on the part boundary.
+type continuationReader struct {
+	c   *ReplicaClient
+	ctx context.Context
+	key string
+
+	rc      io.ReadCloser
+	nextOff int64 // start of the continuation; negative once it has been opened
+}
+
+func (r *continuationReader) Read(p []byte) (int, error) {
+	for {
+		if r.rc != nil {
+			n, err := r.rc.Read(p)
+			if n > 0 {
+				return n, nil
+			}
+			if err == nil {
+				continue
+			}
+			if err != io.EOF {
+				return 0, err
+			}
+			_ = r.rc.Close()
+			r.rc = nil
+		}
+
+		if r.nextOff < 0 {
+			return 0, io.EOF
+		}
+		off := r.nextOff
+		r.nextOff = -1
+
+		rc, err := r.c.getRange(r.ctx, r.key, off, 0)
+		if err != nil {
+			if isRangeNotSatisfiable(err) {
+				// Nothing follows: the object ended on the part boundary.
+				return 0, io.EOF
+			}
+			return 0, err
+		}
+		r.rc = rc
+	}
+}
+
+func (r *continuationReader) Close() error {
+	if r.rc != nil {
+		return r.rc.Close()
+	}
+	return nil
+}
