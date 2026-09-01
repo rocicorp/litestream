@@ -4130,3 +4130,67 @@ dbs:
 		})
 	}
 }
+
+// TestS3ReplicaConfig_DownloadGlobalInheritance verifies top-level download
+// settings reach each replica, and that an explicit per-replica value -- zero
+// included -- still wins.
+func TestS3ReplicaConfig_DownloadGlobalInheritance(t *testing.T) {
+	newClient := func(t *testing.T, body string) *s3.ReplicaClient {
+		t.Helper()
+
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(body[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := main.NewReplicaFromConfig(cfg.DBs[0].Replicas[0], nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, ok := r.Client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatal("expected S3 replica client")
+		}
+		return client
+	}
+
+	t.Run("Inherited", func(t *testing.T) {
+		client := newClient(t, `
+download-part-size: 32MiB
+download-concurrency: 12
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+`)
+		if got, want := client.DownloadPartSize, int64(32*1024*1024); got != want {
+			t.Errorf("DownloadPartSize = %d, want %d (global value ignored)", got, want)
+		}
+		if got, want := client.DownloadConcurrency, 12; got != want {
+			t.Errorf("DownloadConcurrency = %d, want %d (global value ignored)", got, want)
+		}
+	})
+
+	t.Run("ReplicaOverridesWithZero", func(t *testing.T) {
+		client := newClient(t, `
+download-concurrency: 12
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+        download-concurrency: 0
+`)
+		if got := client.DownloadConcurrency; got != 0 {
+			t.Errorf("DownloadConcurrency = %d, want 0 (explicit replica zero overridden by global)", got)
+		}
+	})
+}

@@ -1249,6 +1249,14 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	if rs.StorageClass == "" {
 		rs.StorageClass = src.StorageClass
 	}
+	// Nil-preserving so an explicit per-replica `download-concurrency: 0`
+	// is not overwritten by a global value.
+	if rs.DownloadPartSize == nil {
+		rs.DownloadPartSize = src.DownloadPartSize
+	}
+	if rs.DownloadConcurrency == nil {
+		rs.DownloadConcurrency = src.DownloadConcurrency
+	}
 
 	// S3 SSE settings
 	if rs.SSECustomerAlgorithm == "" {

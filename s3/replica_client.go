@@ -737,6 +737,10 @@ func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size 
 		if err != nil {
 			return nil, err
 		}
+		if err := checkObjectLength(key, offset, size, out); err != nil {
+			_ = out.Body.Close()
+			return nil, err
+		}
 		return out.Body, nil
 	}
 
@@ -758,17 +762,9 @@ func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size 
 	switch {
 	case size > 0:
 		total = size
-
-		// Callers derive the size from the replica listing and LTX files are
-		// immutable, so asking for more than exists means the listing and the
-		// object disagree -- a truncated upload, or a stale index. Serving the
-		// short read would hand the caller known-incomplete LTX data and
-		// resurface as an unrelated decode failure further downstream, so fail
-		// here where the cause is still visible.
-		if haveRemaining && remaining < total {
+		if err := checkObjectLength(key, offset, size, out); err != nil {
 			_ = out.Body.Close()
-			return nil, fmt.Errorf("s3: %s: requested %d bytes at offset %d but object holds %d",
-				key, size, offset, remaining)
+			return nil, err
 		}
 
 	case haveRemaining:
@@ -848,6 +844,27 @@ func (c *ReplicaClient) downloadPool() *chunkPool {
 			"requested-concurrency", c.DownloadConcurrency, "requested-part-size", c.downloadPartSize())
 	}
 	return pool
+}
+
+// checkObjectLength reports a caller asking for more bytes than the object
+// holds.
+//
+// Callers derive the size from the replica listing and LTX files are immutable,
+// so an overrun means the listing and the object disagree -- a truncated upload,
+// or a stale index. A ranged GET clamps silently, so without this the caller is
+// handed known-incomplete LTX data and the failure resurfaces as an unrelated
+// decode error much further downstream. Applies to every read, not just the
+// multipart ones: a short object is just as wrong when it fits in one part.
+func checkObjectLength(key string, offset, size int64, out *s3.GetObjectOutput) error {
+	if size <= 0 {
+		return nil
+	}
+	remaining, ok := remainingFromContentRange(aws.ToString(out.ContentRange), offset)
+	if !ok || remaining >= size {
+		return nil
+	}
+	return fmt.Errorf("s3: %s: requested %d bytes at offset %d but object holds %d",
+		key, size, offset, remaining)
 }
 
 // getObjectInput builds a ranged GetObject request for key. A size of zero reads

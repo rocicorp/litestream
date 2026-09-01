@@ -794,6 +794,43 @@ func TestOpenLTXFile_MultipartOversizedRequest(t *testing.T) {
 	}
 }
 
+// TestOpenLTXFile_OversizedRequestOnSingleGetPaths verifies the same check binds
+// on the reads that never reach the multipart planner: a short object is just as
+// wrong when multipart is off, or when the caller's size fits in one part.
+func TestOpenLTXFile_OversizedRequestOnSingleGetPaths(t *testing.T) {
+	const (
+		partSize = 1024
+		size     = 100
+	)
+
+	for _, tt := range []struct {
+		name        string
+		concurrency int
+		request     int64
+	}{
+		{name: "MultipartDisabled", concurrency: 0, request: partSize},
+		{name: "FitsInOnePart", concurrency: 6, request: partSize},
+		{name: "SmallerThanPart", concurrency: 6, request: size * 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, server := newRangeServer(t, size)
+
+			client := newTestReplicaClient(t, server)
+			client.DownloadPartSize = partSize
+			client.DownloadConcurrency = tt.concurrency
+
+			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, tt.request)
+			if err == nil {
+				_ = rc.Close()
+				t.Fatal("expected an error when more bytes are requested than the object holds")
+			}
+			if !strings.Contains(err.Error(), "object holds 100") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 // TestOpenLTXFile_DownloadConcurrencyBelowMinimum verifies that a pool too small
 // to seat a single reader is treated as disabled, rather than making every large
 // read pay for a part-sized probe it can never use.
