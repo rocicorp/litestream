@@ -644,9 +644,10 @@ func TestChunkPool_RampLeavesRoomToRegister(t *testing.T) {
 	}
 }
 
-// TestChunkPool_RampWidensWithProgress verifies a reader's window doubles as it
-// consumes chunks, up to its share of the pool.
-func TestChunkPool_RampWidensWithProgress(t *testing.T) {
+// TestChunkPool_WindowOpensAfterFirstChunk verifies a reader is pinned to its
+// reservation until it has consumed a chunk, and takes its full share from then
+// on -- not a gradual ramp.
+func TestChunkPool_WindowOpensAfterFirstChunk(t *testing.T) {
 	p := newChunkPool(16, 16)
 
 	l := p.register()
@@ -654,8 +655,8 @@ func TestChunkPool_RampWidensWithProgress(t *testing.T) {
 		t.Fatal("register failed")
 	}
 
-	// share is size/(readers+1) = 8, and the ramp is 2, 4, 8, 8, ...
-	for _, want := range []int{2, 4, 8, 8} {
+	// share is size/(readers+1) = 8; the window is minReaderChunks, then share.
+	for round, want := range []int{minReaderChunks, 8, 8} {
 		var held [][]byte
 		for {
 			buf := l.acquire()
@@ -665,10 +666,10 @@ func TestChunkPool_RampWidensWithProgress(t *testing.T) {
 			held = append(held, buf)
 		}
 		if len(held) != want {
-			t.Fatalf("window = %d, want %d (retired=%d)", len(held), want, l.retired)
+			t.Fatalf("round %d: window = %d, want %d (retired=%d)", round, len(held), want, l.retired)
 		}
 		// Retire one chunk and reclaim the rest without crediting progress for
-		// them, so the next round observes exactly one doubling.
+		// them, so each round differs only by that single retirement.
 		l.release(held[0])
 		for _, buf := range held[1:] {
 			l.release(buf)

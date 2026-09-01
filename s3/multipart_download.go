@@ -84,19 +84,25 @@ func (p *chunkPool) shareLocked() int {
 	return share
 }
 
-// rampLocked bounds a reader to minReaderChunks doubled once per chunk it has
-// already consumed.
+// rampLocked holds a reader to its reservation until it has consumed a chunk,
+// after which it may take its full share.
 //
-// Readers register as the compactor decodes each input's header, so they all
-// arrive before any of them has retired a single chunk. Without a ramp the
-// first reader would reach its full share during that window and its surplus
-// would push later files off the pool and onto the single-stream fallback. The
-// doubling is fast enough that a reader is at full width a few chunks in.
+// This exists to keep a reader from hoarding the pool before its peers have
+// registered. Readers register as the compactor decodes each input's header, so
+// they all arrive before any of them has retired a chunk -- decoding a header
+// reads a few hundred bytes, not a whole part. Pinning the window to the
+// reservation for exactly that long is enough, and costs one chunk of reduced
+// look-ahead rather than several.
+//
+// It only bites when the pool is tight relative to the number of readers. At
+// the default size the shareLocked phantom-reader divisor already guarantees a
+// newcomer can register even against a reader at full width; a small pool (see
+// TestChunkPool_RampLeavesRoomToRegister) is where this matters.
 func (l *chunkLease) rampLocked() int {
-	if l.retired >= 30 {
-		return l.pool.size
+	if l.retired == 0 {
+		return minReaderChunks
 	}
-	return minReaderChunks << l.retired
+	return l.pool.size // no longer limiting; shareLocked governs
 }
 
 func (p *chunkPool) takeLocked() []byte {
