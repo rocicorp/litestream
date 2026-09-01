@@ -1623,7 +1623,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 
 	// Fetch latest L0 LTX file from replica
 	minTXID, maxTXID := replicaInfo.MinTXID, replicaInfo.MaxTXID
-	reader, err := db.Replica.Client.OpenLTXFile(ctx, 0, minTXID, maxTXID, 0, 0)
+	reader, err := db.Replica.Client.OpenLTXFile(ctx, 0, minTXID, maxTXID, 0, replicaInfo.Size)
 	if err != nil {
 		return fmt.Errorf("open remote L0 file: %w", err)
 	}

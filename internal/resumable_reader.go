@@ -92,7 +92,15 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		// Reopen the stream from the current offset if the previous
 		// connection was closed (rc is nil after a retry).
 		if r.rc == nil {
-			rc, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
+			// Request exactly the bytes that remain when the size is known so
+			// the backend can plan the read up front -- the S3 client uses it
+			// to decide between a single GET and a parallel multipart download
+			// without having to probe for the object size.
+			var remaining int64
+			if r.size > r.offset {
+				remaining = r.size - r.offset
+			}
+			rc, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, r.offset, remaining)
 			if err != nil {
 				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || r.ctx.Err() != nil {
 					return 0, fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)

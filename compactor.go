@@ -145,7 +145,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 			}
 		}
 
-		f, err := c.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+		f, err := c.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, info.Size)
 		if err != nil {
 			return nil, fmt.Errorf("open ltx file: %w", err)
 		}

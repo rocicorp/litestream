@@ -686,7 +686,7 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 
 	for _, info := range infos {
 		h.logger.Debug("opening ltx file for hydration", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
-		rc, err := h.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+		rc, err := h.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, info.Size)
 		if err != nil {
 			return fmt.Errorf("open ltx file: %w", err)
 		}
@@ -756,7 +756,7 @@ func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
 	h.logger.Debug("applying ltx to hydration file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 	// Fetch entire LTX file
-	rc, err := h.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+	rc, err := h.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, info.Size)
 	if err != nil {
 		return fmt.Errorf("open ltx file: %w", err)
 	}

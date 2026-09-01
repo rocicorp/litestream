@@ -495,3 +495,50 @@ func TestResumableReader_ContextCancelAbortsBackoff(t *testing.T) {
 		t.Fatal("read after cancellation reopened the file; cancellation must be sticky")
 	}
 }
+
+// TestResumableReader_RequestsRemainingSize verifies the reader tells the
+// backend how many bytes are left, so a client that can plan the transfer (the
+// S3 multipart download) does not have to discover the size itself.
+func TestResumableReader_RequestsRemainingSize(t *testing.T) {
+	data := []byte("hello world, this is a longer payload")
+
+	type call struct{ offset, size int64 }
+	var calls []call
+
+	fail := true
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			calls = append(calls, call{offset, size})
+			if fail {
+				// Break the first stream part-way to force a reopen at an offset.
+				fail = false
+				return io.NopCloser(&errorAfterN{data: data, n: 5, err: fmt.Errorf("connection reset")}), nil
+			}
+			return io.NopCloser(bytes.NewReader(data[offset : offset+size])), nil
+		},
+	}
+
+	// Construct directly rather than via newTestResumableReader, which primes a
+	// reader of its own and would show up as an extra open.
+	r := NewResumableReader(context.Background(), client, 0, 1, 1, int64(len(data)), nil, slog.Default())
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("got %q, want %q", got, data)
+	}
+
+	want := []call{
+		{offset: 0, size: int64(len(data))},
+		{offset: 5, size: int64(len(data)) - 5},
+	}
+	if len(calls) != len(want) {
+		t.Fatalf("got %d opens, want %d: %+v", len(calls), len(want), calls)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Errorf("open %d = %+v, want %+v", i, calls[i], want[i])
+		}
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -736,4 +737,86 @@ func countCompactorPipeWriters() int {
 	buf := make([]byte, 2<<20)
 	n := runtime.Stack(buf, true)
 	return strings.Count(string(buf[:n]), "github.com/benbjohnson/litestream.(*Compactor).Compact.func")
+}
+
+// TestCompactor_CompactPassesFileSize verifies the compactor tells the replica
+// client how large each source file is. Backends use it to bound the range
+// request instead of reading open-ended to EOF.
+func TestCompactor_CompactPassesFileSize(t *testing.T) {
+	client := &recordingCompactionClient{ReplicaClient: file.NewReplicaClient(t.TempDir())}
+	compactor := litestream.NewCompactor(client, slog.Default())
+
+	createTestLTXFile(t, client, 0, 1, 1)
+	createTestLTXFile(t, client, 0, 2, 2)
+
+	// Record the true sizes before compacting.
+	want := make(map[ltx.TXID]int64)
+	itr, err := client.LTXFiles(context.Background(), 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for itr.Next() {
+		info := itr.Item()
+		want[info.MinTXID] = info.Size
+	}
+	if err := itr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != 2 {
+		t.Fatalf("expected 2 source files, got %d", len(want))
+	}
+
+	client.reset()
+	if _, err := compactor.Compact(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	opens := client.calls()
+	if len(opens) != len(want) {
+		t.Fatalf("got %d opens, want %d: %+v", len(opens), len(want), opens)
+	}
+	for _, got := range opens {
+		if got.offset != 0 {
+			t.Errorf("open at offset %d, want 0", got.offset)
+		}
+		if got.size != want[got.minTXID] {
+			t.Errorf("open of %s: size=%d, want %d", got.minTXID, got.size, want[got.minTXID])
+		}
+		if got.size == 0 {
+			t.Errorf("open of %s passed size 0; the known file size was dropped", got.minTXID)
+		}
+	}
+}
+
+type compactionOpen struct {
+	minTXID      ltx.TXID
+	offset, size int64
+}
+
+// recordingCompactionClient records the arguments of every OpenLTXFile call.
+type recordingCompactionClient struct {
+	litestream.ReplicaClient
+
+	mu    sync.Mutex
+	opens []compactionOpen
+}
+
+func (c *recordingCompactionClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	c.mu.Lock()
+	c.opens = append(c.opens, compactionOpen{minTXID: minTXID, offset: offset, size: size})
+	c.mu.Unlock()
+
+	return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+func (c *recordingCompactionClient) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.opens = nil
+}
+
+func (c *recordingCompactionClient) calls() []compactionOpen {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]compactionOpen(nil), c.opens...)
 }
