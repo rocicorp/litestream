@@ -93,9 +93,8 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		// connection was closed (rc is nil after a retry).
 		if r.rc == nil {
 			// Request exactly the bytes that remain when the size is known so
-			// the backend can plan the read up front -- the S3 client uses it
-			// to decide between a single GET and a parallel multipart download
-			// without having to probe for the object size.
+			// backends can issue a bounded range request and know how much data
+			// to expect without probing for the object size.
 			var remaining int64
 			if r.size > r.offset {
 				remaining = r.size - r.offset

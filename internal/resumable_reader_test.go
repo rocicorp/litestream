@@ -497,8 +497,8 @@ func TestResumableReader_ContextCancelAbortsBackoff(t *testing.T) {
 }
 
 // TestResumableReader_RequestsRemainingSize verifies the reader tells the
-// backend how many bytes are left, so a client that can plan the transfer (the
-// S3 multipart download) does not have to discover the size itself.
+// backend how many bytes are left, allowing it to issue bounded range requests
+// and plan the transfer without discovering the size itself.
 func TestResumableReader_RequestsRemainingSize(t *testing.T) {
 	data := []byte("hello world, this is a longer payload")
 
