@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	"github.com/benbjohnson/litestream/internal"
 )
 
 // Default multipart download settings.
@@ -44,13 +42,12 @@ const downloadPartRetries = 3
 // download in the process. Buffers are allocated on first use and recycled, so a
 // process that never downloads a large file never allocates any.
 type chunkPool struct {
-	mu        sync.Mutex
-	size      int      // maximum number of live buffers
-	partSize  int64    // size of each buffer
-	readers   int      // registered readers; readers*minReaderChunks slots are reserved
-	surplus   int      // slots granted beyond the per-reader reservations
-	allocated int      // buffers ever created; bounded by size
-	free      [][]byte // idle buffers available for reuse
+	mu       sync.Mutex
+	size     int      // maximum number of live buffers
+	partSize int64    // size of each buffer
+	readers  int      // registered readers; readers*minReaderChunks slots are reserved
+	surplus  int      // slots granted beyond the per-reader reservations
+	free     [][]byte // idle buffers available for reuse
 }
 
 func newChunkPool(size int, partSize int64) *chunkPool {
@@ -112,7 +109,6 @@ func (p *chunkPool) takeLocked() []byte {
 		p.free = p.free[:n-1]
 		return buf
 	}
-	p.allocated++
 	return make([]byte, p.partSize)
 }
 
@@ -505,72 +501,4 @@ func remainingFromContentRange(v string, offset int64) (int64, bool) {
 		return 0, false
 	}
 	return total - offset, true
-}
-
-// recordGet records a completed GET request against the operation metrics.
-func recordGet(n int64) {
-	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	if n > 0 {
-		internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(n))
-	}
-}
-
-// continuationReader serves one body and then continues from the byte that
-// follows it, opening the continuation only once the first body is drained.
-//
-// It exists for providers that omit Content-Range on a ranged GET. The object
-// length is unknown, so a parallel download cannot be planned, but the part
-// already in flight is still valid data and must not be thrown away. Whether
-// anything follows it is answered by the continuation itself: bytes mean the
-// object continues, and 416 means it ended exactly on the part boundary.
-type continuationReader struct {
-	c   *ReplicaClient
-	ctx context.Context
-	key string
-
-	rc       io.ReadCloser
-	nextOff  int64 // start of the continuation; negative once it has been opened
-	nextSize int64 // length of the continuation; zero reads to the end of the object
-}
-
-func (r *continuationReader) Read(p []byte) (int, error) {
-	for {
-		if r.rc != nil {
-			n, err := r.rc.Read(p)
-			if n > 0 {
-				return n, nil
-			}
-			if err == nil {
-				continue
-			}
-			if err != io.EOF {
-				return 0, err
-			}
-			_ = r.rc.Close()
-			r.rc = nil
-		}
-
-		if r.nextOff < 0 {
-			return 0, io.EOF
-		}
-		off := r.nextOff
-		r.nextOff = -1
-
-		rc, err := r.c.getRange(r.ctx, r.key, off, r.nextSize)
-		if err != nil {
-			if isRangeNotSatisfiable(err) {
-				// Nothing follows: the object ended on the part boundary.
-				return 0, io.EOF
-			}
-			return 0, err
-		}
-		r.rc = rc
-	}
-}
-
-func (r *continuationReader) Close() error {
-	if r.rc != nil {
-		return r.rc.Close()
-	}
-	return nil
 }

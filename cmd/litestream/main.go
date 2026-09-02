@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -1593,11 +1594,14 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 			udownloadPartSize = v
 			udownloadPartSizeSet = true
 		}
-		if v, ok, err := litestream.NonNegativeIntQueryValue(query, "downloadConcurrency", "download-concurrency"); err != nil {
-			return nil, err
-		} else if ok {
-			udownloadConcurrency = v
-			udownloadConcurrencySet = true
+		// Parsed by hand rather than with IntQueryValue: zero is a real value
+		// here (it disables multipart downloads), not "unset".
+		if raw := cmp.Or(query.Get("downloadConcurrency"), query.Get("download-concurrency")); raw != "" {
+			v, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || v < 0 {
+				return nil, fmt.Errorf("invalid value for query parameter \"download-concurrency\": %q (must be a non-negative integer)", raw)
+			}
+			udownloadConcurrency, udownloadConcurrencySet = v, true
 		}
 
 		// Only apply URL parts to field that have not been overridden.

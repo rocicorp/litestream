@@ -18,6 +18,7 @@ import (
 	"path"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -230,11 +231,14 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	} else if ok {
 		partSize = v
 	}
-	if v, ok, err := litestream.NonNegativeIntQueryValue(query, "downloadConcurrency", "download-concurrency"); err != nil {
-		return nil, err
-	} else if ok {
-		downloadConcurrency = int(v)
-		downloadConcurrencySet = true
+	// Parsed by hand rather than with IntQueryValue: zero is a real value here
+	// (it disables multipart downloads), not "unset".
+	if raw := cmp.Or(query.Get("downloadConcurrency"), query.Get("download-concurrency")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 {
+			return nil, fmt.Errorf("invalid value for query parameter \"download-concurrency\": %q (must be a non-negative integer)", raw)
+		}
+		downloadConcurrency, downloadConcurrencySet = v, true
 	}
 	if v, ok, err := litestream.IntQueryValue(query, "downloadPartSize", "download-part-size"); err != nil {
 		return nil, err
@@ -723,16 +727,19 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 // openRange returns a reader over [offset, offset+size) of key, or to the end of
 // the object when size is zero.
 //
-// The first part-sized GET doubles as a size probe. It is chunk 0 of the
-// download either way, so learning the object size costs nothing: a small object
-// comes back whole and is returned as-is -- exactly one GET, no pool buffers, no
-// HEAD -- and only an object spanning more than one part is upgraded to a
-// parallel multipart read.
+// A parallel download needs a known length to plan from and only pays off past
+// one part, so anything else -- multipart disabled, no size, a size that fits in
+// one part, or a pool with no room -- is a single ranged GET, exactly as before.
 func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size int64) (io.ReadCloser, error) {
 	pool := c.downloadPool()
 
-	// Multipart disabled, or the caller already told us it fits in one part.
-	if pool == nil || (size > 0 && size <= pool.partSize) {
+	// Register before fetching anything. A saturated pool refuses rather than
+	// waits, so a reader can never be blocked by its peers; see minReaderChunks.
+	var lease *chunkLease
+	if pool != nil && size > pool.partSize {
+		lease = pool.register()
+	}
+	if lease == nil {
 		out, err := c.getObject(ctx, key, offset, size)
 		if err != nil {
 			return nil, err
@@ -744,106 +751,34 @@ func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size 
 		return out.Body, nil
 	}
 
-	// The pool owns the part size: its buffers must be able to hold a whole
-	// chunk, so the chunk size cannot be varied per client.
-	partSize := pool.partSize
-
-	out, err := c.getObject(ctx, key, offset, partSize)
+	// Chunk 0 is streamed straight from this response; see multipartReader.
+	out, err := c.getObject(ctx, key, offset, pool.partSize)
 	if err != nil {
+		lease.close()
+		return nil, err
+	}
+	if err := checkObjectLength(key, offset, size, out); err != nil {
+		_ = out.Body.Close()
+		lease.close()
 		return nil, err
 	}
 
-	// Work out how many bytes this download covers. The caller's size and the
-	// response's Content-Range are the only two signals; these cases are
-	// exhaustive, so total is never derived from an absent Content-Range.
-	remaining, haveRemaining := remainingFromContentRange(aws.ToString(out.ContentRange), offset)
-
-	var total int64
-	switch {
-	case size > 0:
-		total = size
-		if err := checkObjectLength(key, offset, size, out); err != nil {
-			_ = out.Body.Close()
-			return nil, err
-		}
-
-	case haveRemaining:
-		total = remaining
-
-	default:
-		// The provider omitted Content-Range, so the length is unknown and the
-		// download cannot be planned. A short body means the object ended inside
-		// the first part. A full-length one is ambiguous -- the object may
-		// continue, or may have ended exactly on the part boundary -- but that
-		// is settled by asking for what follows rather than by re-reading what
-		// we already hold: data means there was more, 416 means there was not.
-		if aws.ToInt64(out.ContentLength) < partSize {
-			return out.Body, nil
-		}
-		return &continuationReader{
-			c:       c,
-			ctx:     ctx,
-			key:     key,
-			rc:      out.Body,
-			nextOff: offset + partSize,
-		}, nil
-	}
-
-	if total <= partSize {
-		return out.Body, nil
-	}
-
-	// A saturated pool falls back to a single stream instead of waiting, so a
-	// reader can never be blocked by its peers. See minReaderChunks. The part
-	// already in flight is still good data, so continue from it rather than
-	// discarding it and re-reading from the start.
-	lease := pool.register()
-	if lease == nil {
-		return &continuationReader{
-			c:        c,
-			ctx:      ctx,
-			key:      key,
-			rc:       out.Body,
-			nextOff:  offset + partSize,
-			nextSize: total - partSize,
-		}, nil
-	}
-
 	c.logger.Debug("downloading in parallel parts",
-		"key", key, "offset", offset, "size", total, "part-size", partSize)
+		"key", key, "offset", offset, "size", size, "part-size", pool.partSize)
 
-	return newMultipartReader(ctx, c, key, out.Body, offset, total, partSize, lease), nil
-}
-
-// downloadPartSize returns the size of each parallel download chunk.
-func (c *ReplicaClient) downloadPartSize() int64 {
-	if c.DownloadPartSize > 0 {
-		return c.DownloadPartSize
-	}
-	return DefaultDownloadPartSize
+	return newMultipartReader(ctx, c, key, out.Body, offset, size, pool.partSize, lease), nil
 }
 
 // downloadPool returns the chunk pool for this client, or nil if multipart
-// downloads are disabled.
+// downloads are disabled. A pool that cannot seat one reader is no pool at all.
 func (c *ReplicaClient) downloadPool() *chunkPool {
-	// A pool that cannot seat even one reader would make every large read pay
-	// for a part-sized probe and then fall back, so treat it as disabled.
-	if c.DownloadConcurrency < minReaderChunks {
+	if c.DownloadConcurrency < minReaderChunks || c.DownloadPartSize <= 0 {
 		return nil
 	}
 	if c.pool != nil {
 		return c.pool
 	}
-
-	pool := sharedChunkPool(c.DownloadConcurrency, c.downloadPartSize())
-	if pool.size != c.DownloadConcurrency || pool.partSize != c.downloadPartSize() {
-		// Another replica established the pool first. Downloads still work, so
-		// this is only worth reporting for diagnosis.
-		c.logger.Debug("using established download pool geometry",
-			"pool-concurrency", pool.size, "pool-part-size", pool.partSize,
-			"requested-concurrency", c.DownloadConcurrency, "requested-part-size", c.downloadPartSize())
-	}
-	return pool
+	return sharedChunkPool(c.DownloadConcurrency, c.DownloadPartSize)
 }
 
 // checkObjectLength reports a caller asking for more bytes than the object
@@ -853,8 +788,7 @@ func (c *ReplicaClient) downloadPool() *chunkPool {
 // so an overrun means the listing and the object disagree -- a truncated upload,
 // or a stale index. A ranged GET clamps silently, so without this the caller is
 // handed known-incomplete LTX data and the failure resurfaces as an unrelated
-// decode error much further downstream. Applies to every read, not just the
-// multipart ones: a short object is just as wrong when it fits in one part.
+// decode error much further downstream.
 func checkObjectLength(key string, offset, size int64, out *s3.GetObjectOutput) error {
 	if size <= 0 {
 		return nil
@@ -893,7 +827,7 @@ func (c *ReplicaClient) getObjectInput(key string, offset, size int64) *s3.GetOb
 	return input
 }
 
-// getObject issues a ranged GET and records it against the operation metrics.
+// getObject issues a ranged GET.
 func (c *ReplicaClient) getObject(ctx context.Context, key string, offset, size int64) (*s3.GetObjectOutput, error) {
 	out, err := c.s3.GetObject(ctx, c.getObjectInput(key, offset, size))
 	if err != nil {
@@ -902,7 +836,6 @@ func (c *ReplicaClient) getObject(ctx context.Context, key string, offset, size 
 		}
 		return nil, fmt.Errorf("s3: get object %s: %w", key, err)
 	}
-	recordGet(aws.ToInt64(out.ContentLength))
 	return out, nil
 }
 
@@ -2056,24 +1989,6 @@ var (
 	filebaseRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.filebase.com$`)
 	scalewayRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.scw\.cloud$`)
 )
-
-// isRangeNotSatisfiable reports whether err is a 416 from a range request that
-// starts at or past the end of the object.
-func isRangeNotSatisfiable(err error) bool {
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
-		switch apiErr.ErrorCode() {
-		case "InvalidRange", "RequestedRangeNotSatisfiable":
-			return true
-		}
-	}
-
-	var respErr *smithyhttp.ResponseError
-	if errors.As(err, &respErr) {
-		return respErr.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable
-	}
-	return false
-}
 
 func isNotExists(err error) bool {
 	var apiErr smithy.APIError

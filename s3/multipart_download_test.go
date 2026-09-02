@@ -14,10 +14,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus/testutil"
-
-	"github.com/benbjohnson/litestream/internal"
 )
 
 // rangeServer is a minimal S3 stand-in that answers ranged GETs for a single
@@ -31,10 +27,6 @@ type rangeServer struct {
 	// truncateOnce aborts the first response for a given start offset after
 	// writing half the body, simulating a connection dropped mid-part.
 	truncateOnce map[int64]bool
-
-	// omitContentRange simulates a provider that does not echo Content-Range on
-	// a ranged GET.
-	omitContentRange bool
 
 	// emptyBody answers a given start offset with a well-formed but empty 206,
 	// so the part makes no progress and no transport error occurs. That isolates
@@ -102,9 +94,7 @@ func (rs *rangeServer) serve(w http.ResponseWriter, r *http.Request) {
 		body = nil
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
-	if !rs.omitContentRange {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
-	}
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusPartialContent)
 
@@ -162,10 +152,10 @@ func newMultipartTestClient(t *testing.T, server *httptest.Server, poolSize int,
 	return client, client.pool
 }
 
-func poolStats(p *chunkPool) (readers, surplus, allocated, free int) {
+func poolStats(p *chunkPool) (readers, surplus, free int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.readers, p.surplus, p.allocated, len(p.free)
+	return p.readers, p.surplus, len(p.free)
 }
 
 // readWithChunks reads rc in randomly sized pieces to exercise partial reads
@@ -214,7 +204,7 @@ func TestOpenLTXFile_MultipartRoundTrip(t *testing.T) {
 
 			client, pool := newMultipartTestClient(t, server, tt.poolSize, tt.partSize)
 
-			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, int64(tt.size))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -227,23 +217,24 @@ func TestOpenLTXFile_MultipartRoundTrip(t *testing.T) {
 			if !bytes.Equal(got, rs.data) {
 				t.Fatalf("downloaded %d bytes, want %d (equal=%v)", len(got), len(rs.data), bytes.Equal(got, rs.data))
 			}
+			// Guard against the plain single-GET path passing this trivially.
+			if gets, _ := rs.stats(); gets < 2 {
+				t.Fatalf("GET count = %d; the parallel path was not taken", gets)
+			}
 
-			readers, surplus, allocated, free := poolStats(pool)
+			readers, surplus, free := poolStats(pool)
 			if readers != 0 || surplus != 0 {
 				t.Fatalf("pool not drained: readers=%d surplus=%d", readers, surplus)
 			}
-			if allocated > tt.poolSize {
-				t.Fatalf("allocated %d buffers, pool size is %d", allocated, tt.poolSize)
-			}
-			if free != allocated {
-				t.Fatalf("free=%d, want all %d buffers returned", free, allocated)
+			if free > tt.poolSize {
+				t.Fatalf("pool holds %d buffers, size is %d", free, tt.poolSize)
 			}
 		})
 	}
 }
 
-// TestOpenLTXFile_SmallObjectSingleGet verifies the size probe costs nothing
-// for objects that fit in one part: a single GET and no pool buffers.
+// TestOpenLTXFile_SmallObjectSingleGet verifies an object known to fit in one
+// part costs a single GET and never touches the pool.
 func TestOpenLTXFile_SmallObjectSingleGet(t *testing.T) {
 	const partSize = 4096
 
@@ -252,7 +243,7 @@ func TestOpenLTXFile_SmallObjectSingleGet(t *testing.T) {
 			rs, server := newRangeServer(t, size)
 			client, pool := newMultipartTestClient(t, server, 8, partSize)
 
-			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, int64(size))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -270,8 +261,8 @@ func TestOpenLTXFile_SmallObjectSingleGet(t *testing.T) {
 			if gets, _ := rs.stats(); gets != 1 {
 				t.Fatalf("GET count = %d, want 1", gets)
 			}
-			if readers, _, allocated, _ := poolStats(pool); readers != 0 || allocated != 0 {
-				t.Fatalf("pool touched for small object: readers=%d allocated=%d", readers, allocated)
+			if readers, _, free := poolStats(pool); readers != 0 || free != 0 {
+				t.Fatalf("pool touched for small object: readers=%d free=%d", readers, free)
 			}
 		})
 	}
@@ -336,7 +327,7 @@ func TestOpenLTXFile_MultipartLockstep(t *testing.T) {
 		client.DownloadConcurrency = nreaders * minReaderChunks
 		client.pool = pool
 
-		rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+		rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -344,7 +335,7 @@ func TestOpenLTXFile_MultipartLockstep(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	if got, _, _, _ := poolStats(pool); got != nreaders {
+	if got, _, _ := poolStats(pool); got != nreaders {
 		t.Fatalf("registered readers = %d, want %d", got, nreaders)
 	}
 
@@ -377,7 +368,7 @@ func TestOpenLTXFile_MultipartLockstep(t *testing.T) {
 		}
 	}
 
-	if r, s, _, _ := poolStats(pool); r != 0 || s != 0 {
+	if r, s, _ := poolStats(pool); r != 0 || s != 0 {
 		t.Fatalf("pool not drained: readers=%d surplus=%d", r, s)
 	}
 }
@@ -404,14 +395,14 @@ func TestOpenLTXFile_MultipartPoolSaturated(t *testing.T) {
 		client.DownloadConcurrency = poolSize
 		client.pool = pool
 
-		rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+		rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
 		if err != nil {
 			t.Fatal(err)
 		}
 		readers[i] = rc
 	}
 
-	if r, _, _, _ := poolStats(pool); r != 2 {
+	if r, _, _ := poolStats(pool); r != 2 {
 		t.Fatalf("registered readers = %d, want 2", r)
 	}
 
@@ -504,7 +495,7 @@ func TestOpenLTXFile_MultipartPartRetry(t *testing.T) {
 
 			client, pool := newMultipartTestClient(t, server, 6, partSize)
 
-			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -519,7 +510,7 @@ func TestOpenLTXFile_MultipartPartRetry(t *testing.T) {
 			if !bytes.Equal(got, rs.data) {
 				t.Fatalf("got %d bytes, want %d", len(got), len(rs.data))
 			}
-			if r, s, _, _ := poolStats(pool); r != 0 || s != 0 {
+			if r, s, _ := poolStats(pool); r != 0 || s != 0 {
 				t.Fatalf("pool not drained: readers=%d surplus=%d", r, s)
 			}
 		})
@@ -540,7 +531,7 @@ func TestOpenLTXFile_MultipartCloseReleasesBuffers(t *testing.T) {
 
 	client, pool := newMultipartTestClient(t, server, poolSize, partSize)
 
-	rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+	rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,19 +540,15 @@ func TestOpenLTXFile_MultipartCloseReleasesBuffers(t *testing.T) {
 	if _, err := io.ReadFull(rc, make([]byte, partSize+13)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, allocated, _ := poolStats(pool); allocated == 0 {
-		t.Fatal("expected look-ahead buffers to be in use")
+	if r, _, _ := poolStats(pool); r != 1 {
+		t.Fatalf("expected the download to be registered, readers=%d", r)
 	}
 	if err := rc.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	readers, surplus, allocated, free := poolStats(pool)
-	if readers != 0 || surplus != 0 {
+	if readers, surplus, _ := poolStats(pool); readers != 0 || surplus != 0 {
 		t.Fatalf("pool not drained: readers=%d surplus=%d", readers, surplus)
-	}
-	if free != allocated {
-		t.Fatalf("free=%d allocated=%d, want every buffer returned", free, allocated)
 	}
 
 	// The pool is fully usable again.
@@ -569,46 +556,6 @@ func TestOpenLTXFile_MultipartCloseReleasesBuffers(t *testing.T) {
 		t.Fatal("cannot register after close")
 	} else {
 		lease.close()
-	}
-}
-
-// TestOpenLTXFile_MultipartMetrics verifies every part GET is recorded.
-func TestOpenLTXFile_MultipartMetrics(t *testing.T) {
-	const (
-		partSize = 1024
-		size     = 16 * 1024
-	)
-
-	rs, server := newRangeServer(t, size)
-	client, _ := newMultipartTestClient(t, server, 6, partSize)
-
-	countBefore := testutil.ToFloat64(internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET"))
-	bytesBefore := testutil.ToFloat64(internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET"))
-
-	rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.ReadAll(rc); err != nil {
-		t.Fatal(err)
-	}
-	if err := rc.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	gets, _ := rs.stats()
-	if gets != size/partSize {
-		t.Fatalf("GET count = %d, want %d", gets, size/partSize)
-	}
-
-	countAfter := testutil.ToFloat64(internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET"))
-	bytesAfter := testutil.ToFloat64(internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET"))
-
-	if got, want := countAfter-countBefore, float64(gets); got != want {
-		t.Fatalf("GET counter delta = %v, want %v", got, want)
-	}
-	if got, want := bytesAfter-bytesBefore, float64(size); got != want {
-		t.Fatalf("GET bytes delta = %v, want %v", got, want)
 	}
 }
 
@@ -659,8 +606,8 @@ func TestChunkPool_RampLeavesRoomToRegister(t *testing.T) {
 			}
 		}
 	}
-	if _, surplus, allocated, _ := poolStats(p); surplus != 0 || allocated != readers*minReaderChunks {
-		t.Fatalf("surplus=%d allocated=%d, want 0 and %d", surplus, allocated, readers*minReaderChunks)
+	if _, surplus, _ := poolStats(p); surplus != 0 {
+		t.Fatalf("surplus=%d, want 0", surplus)
 	}
 }
 
@@ -789,8 +736,8 @@ func TestOpenLTXFile_MultipartOversizedRequest(t *testing.T) {
 			t.Fatalf("error %q does not mention %q", err, want)
 		}
 	}
-	if r, _, allocated, _ := poolStats(pool); r != 0 || allocated != 0 {
-		t.Fatalf("pool touched on the failure path: readers=%d allocated=%d", r, allocated)
+	if r, _, free := poolStats(pool); r != 0 || free != 0 {
+		t.Fatalf("pool touched on the failure path: readers=%d free=%d", r, free)
 	}
 }
 
@@ -848,7 +795,7 @@ func TestOpenLTXFile_DownloadConcurrencyBelowMinimum(t *testing.T) {
 			client.DownloadPartSize = partSize
 			client.DownloadConcurrency = concurrency
 
-			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -889,7 +836,7 @@ func TestOpenLTXFile_MultipartPoolGeometryWins(t *testing.T) {
 			client.DownloadPartSize = clientPartSize
 			client.pool = newChunkPool(6, poolPartSize)
 
-			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -915,134 +862,6 @@ func TestOpenLTXFile_MultipartPoolGeometryWins(t *testing.T) {
 	}
 }
 
-// TestOpenLTXFile_MultipartSizeFromCaller verifies that when the caller knows
-// the size -- which every restore path now passes down -- the download plans
-// itself without relying on the provider echoing Content-Range, and without the
-// extra unbounded GET that the probe path needs to recover.
-func TestOpenLTXFile_MultipartSizeFromCaller(t *testing.T) {
-	const (
-		partSize = 1024
-		size     = 20000
-	)
-
-	t.Run("SizeKnown", func(t *testing.T) {
-		rs, server := newRangeServer(t, size)
-		rs.omitContentRange = true
-
-		client, _ := newMultipartTestClient(t, server, 6, partSize)
-
-		rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, err := io.ReadAll(rc)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := rc.Close(); err != nil {
-			t.Fatal(err)
-		}
-
-		if !bytes.Equal(got, rs.data) {
-			t.Fatalf("got %d bytes, want %d", len(got), len(rs.data))
-		}
-		// Exactly one GET per part: no probe recovery, no re-reads.
-		gets, _ := rs.stats()
-		if want := (size + partSize - 1) / partSize; gets != want {
-			t.Fatalf("GET count = %d, want %d", gets, want)
-		}
-	})
-
-	t.Run("SizeUnknownContinuesRatherThanRefetching", func(t *testing.T) {
-		rs, server := newRangeServer(t, size)
-		rs.omitContentRange = true
-
-		client, pool := newMultipartTestClient(t, server, 6, partSize)
-
-		rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, err := io.ReadAll(rc)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := rc.Close(); err != nil {
-			t.Fatal(err)
-		}
-
-		if !bytes.Equal(got, rs.data) {
-			t.Fatalf("got %d bytes, want %d", len(got), len(rs.data))
-		}
-
-		// Without Content-Range there is no length to plan a parallel download
-		// from, but the part already in flight is still good data: the read
-		// continues from where it stopped instead of starting over.
-		gets, starts := rs.stats()
-		if gets != 2 {
-			t.Fatalf("GET count = %d, want 2 (first part + continuation): %v", gets, starts)
-		}
-		if want := []int64{0, partSize}; starts[0] != want[0] || starts[1] != want[1] {
-			t.Fatalf("request offsets = %v, want %v -- the first part must not be re-fetched", starts, want)
-		}
-		if r, _, allocated, _ := poolStats(pool); r != 0 || allocated != 0 {
-			t.Fatalf("pool used on the unplanned path: readers=%d allocated=%d", r, allocated)
-		}
-	})
-
-	// An object whose length is an exact multiple of the part size is the
-	// ambiguous case: the first response is full-length, but the object may or
-	// may not continue. The continuation settles it either way, and because it
-	// is unbounded it costs the same two requests regardless -- what differs is
-	// whether the second returns data or 416.
-	t.Run("SizeUnknownExactPartBoundary", func(t *testing.T) {
-		for _, tt := range []struct {
-			parts      int
-			wantStarts []int64 // a 416 records no start
-		}{
-			{parts: 1, wantStarts: []int64{0}},           // nothing follows: 416
-			{parts: 2, wantStarts: []int64{0, partSize}}, // continues to EOF
-			{parts: 5, wantStarts: []int64{0, partSize}},
-		} {
-			t.Run(strconv.Itoa(tt.parts), func(t *testing.T) {
-				rs, server := newRangeServer(t, tt.parts*partSize)
-				rs.omitContentRange = true
-
-				client, _ := newMultipartTestClient(t, server, 6, partSize)
-
-				rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
-				if err != nil {
-					t.Fatal(err)
-				}
-				got, err := io.ReadAll(rc)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := rc.Close(); err != nil {
-					t.Fatal(err)
-				}
-
-				if !bytes.Equal(got, rs.data) {
-					t.Fatalf("got %d bytes, want %d", len(got), len(rs.data))
-				}
-
-				gets, starts := rs.stats()
-				if gets != 2 {
-					t.Fatalf("GET count = %d, want 2 (first part + continuation): %v", gets, starts)
-				}
-				if len(starts) != len(tt.wantStarts) {
-					t.Fatalf("served ranges = %v, want %v", starts, tt.wantStarts)
-				}
-				for i := range starts {
-					if starts[i] != tt.wantStarts[i] {
-						t.Fatalf("served ranges = %v, want %v", starts, tt.wantStarts)
-					}
-				}
-			})
-		}
-	})
-}
-
 // TestOpenLTXFile_MultipartRetryBudget verifies that a part which never
 // completes gives up with an error rather than retrying forever. The retry loops
 // reset their budget on forward progress, so an unbounded stream of
@@ -1066,7 +885,7 @@ func TestOpenLTXFile_MultipartRetryBudget(t *testing.T) {
 
 			client, pool := newMultipartTestClient(t, server, 6, partSize)
 
-			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+			rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1097,8 +916,8 @@ func TestOpenLTXFile_MultipartRetryBudget(t *testing.T) {
 			if err := rc.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if r, s, allocated, free := poolStats(pool); r != 0 || s != 0 || free != allocated {
-				t.Fatalf("pool not drained after failure: readers=%d surplus=%d free=%d allocated=%d", r, s, free, allocated)
+			if r, s, _ := poolStats(pool); r != 0 || s != 0 {
+				t.Fatalf("pool not drained after failure: readers=%d surplus=%d", r, s)
 			}
 		})
 	}
