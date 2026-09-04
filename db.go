@@ -93,6 +93,13 @@ type DB struct {
 		value *ltx.Pos
 	}
 
+	// Final WAL frame captured by the most recent LTX write. verify() uses it
+	// to confirm the WAL hasn't been overwritten since the last sync without
+	// scanning the (potentially snapshot-sized) LTX file. See lastPageMatch.
+	// Guarded by execSem: it is written in sync() and read in lastPageMatch,
+	// both of which run only under the sync executor lock.
+	lastSyncedFrame *syncedFrame
+
 	fileInfo os.FileInfo // db info cached during init
 	dirInfo  os.FileInfo // parent dir info cached during init
 
@@ -537,6 +544,12 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 	db.maxLTXFileInfos.Lock()
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 	db.maxLTXFileInfos.Unlock()
+
+	// NOTE: lastSyncedFrame is intentionally left untouched here. It is guarded
+	// by execSem, which this recovery path deliberately does not hold, so
+	// writing it would be a data race. It is safe to leave stale: after this
+	// reset the next sync sees pos.TXID == 0 and returns early from verify
+	// (first-sync path) without consulting lastSyncedFrame, then overwrites it.
 
 	db.invalidatePosCache()
 
@@ -1822,6 +1835,15 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	return info, nil
 }
 
+// syncedFrame records the final WAL frame captured by the most recent LTX
+// write, keyed by the LTX's TXID and the WAL offset just past the frame. It
+// lets lastPageMatch confirm the WAL is unchanged without scanning the LTX.
+type syncedFrame struct {
+	txid      ltx.TXID
+	walOffset int64  // WAL offset just past the frame (== next sync's info.offset)
+	frame     []byte // raw WAL frame bytes (header + page) at walOffset-frameSize
+}
+
 // lastPageMatch checks if the last page read in the WAL exists in the last LTX file.
 func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset, frameSize int64) (bool, error) {
 	if prevWALOffset <= WALHeaderSize {
@@ -1832,6 +1854,19 @@ func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset
 	if err != nil {
 		return false, fmt.Errorf("cannot read last synced wal page: %w", err)
 	}
+
+	// Fast path: if this WAL frame is byte-identical to the one we captured
+	// when we wrote this LTX, the WAL hasn't been overwritten and the page is
+	// present in the LTX (we wrote it there), so we can skip scanning the file.
+	// This avoids an O(LTX size) scan on the first sync after a snapshot-sized
+	// LTX. A cold cache or any mismatch falls through to the full scan below.
+	if sf := db.lastSyncedFrame; sf != nil &&
+		sf.txid == dec.Header().MaxTXID &&
+		sf.walOffset == prevWALOffset+frameSize &&
+		bytes.Equal(frame, sf.frame) {
+		return true, nil
+	}
+
 	pgno := binary.BigEndian.Uint32(frame[0:])
 	fsalt1 := binary.BigEndian.Uint32(frame[8:])
 	fsalt2 := binary.BigEndian.Uint32(frame[12:])
@@ -2282,6 +2317,25 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		})
 
 	db.Logger.Debug("db sync", "status", "ok")
+
+	// Cache the final WAL frame of this LTX so the next verify() can confirm
+	// the WAL is unchanged without scanning this (possibly snapshot-sized) LTX
+	// file. Best-effort: on any read error we simply leave the cache stale (the
+	// TXID/offset key prevents a stale entry from matching) and verify() falls
+	// back to the full scan. finalOffset is the next sync's info.offset, so its
+	// last frame — the one verify() will re-read — sits at finalOffset-frameSize.
+	if frameSize := int64(db.pageSize + WALFrameHeaderSize); finalOffset-frameSize > WALHeaderSize {
+		fr, err := readWALFileAt(db.WALPath(), finalOffset-frameSize, frameSize)
+		if err != nil {
+			// Leave nothing stale behind: clear the cache so the invariant stays
+			// "lastSyncedFrame is nil or reflects the most recent successful LTX
+			// write." The next verify() falls back to the full scan.
+			db.lastSyncedFrame = nil
+			db.Logger.Warn("could not read last WAL frame for lastSyncedFrame optimization", "error", err)
+		} else {
+			db.lastSyncedFrame = &syncedFrame{txid: txID, walOffset: finalOffset, frame: fr}
+		}
+	}
 
 	return result, nil
 }

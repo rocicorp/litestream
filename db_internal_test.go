@@ -1946,6 +1946,110 @@ func TestDB_Verify_WALOffsetAtHeader(t *testing.T) {
 	}
 }
 
+// TestDB_LastPageMatch_FastPathMatchesScan verifies that the cached-frame fast
+// path in lastPageMatch is populated after a sync and returns the same verify()
+// result as the full LTX scan it replaces.
+func TestDB_LastPageMatch_FastPathMatchesScan(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	// Keep the WAL intact between syncs so verify() reaches lastPageMatch.
+	db.MinCheckpointPageN = 1 << 30
+	db.TruncatePageN = 1 << 30
+	db.CheckpointInterval = time.Hour
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal; PRAGMA wal_autocheckpoint = 0;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 200) INSERT INTO t (v) SELECT hex(randomblob(64)) FROM c`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initial sync (snapshot).
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second batch + incremental sync so the latest LTX covers real WAL frames.
+	if _, err := sqldb.Exec(`WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 200) INSERT INTO t (v) SELECT hex(randomblob(64)) FROM c`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The cache should now hold the final frame of the latest LTX.
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sf := db.lastSyncedFrame
+	if sf == nil {
+		t.Fatal("expected lastSyncedFrame to be populated after sync")
+	}
+	if sf.txid != pos.TXID {
+		t.Fatalf("cached txid=%s, want pos txid=%s", sf.txid, pos.TXID)
+	}
+	if sf.walOffset <= WALHeaderSize {
+		t.Fatalf("cached walOffset=%d, want > %d", sf.walOffset, WALHeaderSize)
+	}
+
+	// Grow the WAL past the last sync (without overwriting it) so verify()
+	// reaches lastPageMatch rather than an early return.
+	if _, err := sqldb.Exec(`WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 50) INSERT INTO t (v) SELECT hex(randomblob(64)) FROM c`); err != nil {
+		t.Fatal(err)
+	}
+	db.invalidatePosCache()
+
+	// Warm cache: the fast path should confirm the WAL is unchanged.
+	warm, err := db.verify(context.Background(), &db.syncState)
+	if err != nil {
+		t.Fatalf("verify (warm cache): %v", err)
+	}
+
+	// Cold cache: the same call must fall back to the full scan and agree.
+	db.lastSyncedFrame = nil
+	cold, err := db.verify(context.Background(), &db.syncState)
+	if err != nil {
+		t.Fatalf("verify (cold cache): %v", err)
+	}
+
+	if warm.snapshotting != cold.snapshotting {
+		t.Errorf("snapshotting mismatch: warm=%v cold=%v", warm.snapshotting, cold.snapshotting)
+	}
+	if warm.offset != cold.offset {
+		t.Errorf("offset mismatch: warm=%d cold=%d", warm.offset, cold.offset)
+	}
+	if warm.reason != cold.reason {
+		t.Errorf("reason mismatch: warm=%q cold=%q", warm.reason, cold.reason)
+	}
+	if warm.snapshotting {
+		t.Errorf("expected snapshotting=false for an unmodified WAL, got true")
+	}
+}
+
 // TestDB_Verify_WALOffsetAtHeader_SaltMismatch tests that verify() correctly
 // triggers a snapshot when WALOffset=WALHeaderSize, WALSize=0, and the salt
 // values don't match the current WAL header.
