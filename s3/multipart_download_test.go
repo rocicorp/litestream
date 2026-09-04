@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +29,10 @@ type rangeServer struct {
 	// truncateOnce aborts the first response for a given start offset after
 	// writing half the body, simulating a connection dropped mid-part.
 	truncateOnce map[int64]bool
+
+	// maxBody caps every response body to this many bytes, so a part advances
+	// only a little per connection. Zero means no cap.
+	maxBody int
 
 	// emptyBody answers a given start offset with a well-formed but empty 206,
 	// so the part makes no progress and no transport error occurs. That isolates
@@ -92,6 +98,10 @@ func (rs *rangeServer) serve(w http.ResponseWriter, r *http.Request) {
 	body := rs.data[start : end+1]
 	if empty {
 		body = nil
+	}
+	if rs.maxBody > 0 && len(body) > rs.maxBody {
+		body = body[:rs.maxBody]
+		end = start + int64(rs.maxBody) - 1
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
@@ -872,6 +882,10 @@ func TestOpenLTXFile_MultipartRetryBudget(t *testing.T) {
 		size     = 20000
 	)
 
+	restore := downloadPartBackoff
+	downloadPartBackoff = time.Millisecond
+	t.Cleanup(func() { downloadPartBackoff = restore })
+
 	for _, name := range []string{"head", "lookahead"} {
 		t.Run(name, func(t *testing.T) {
 			rs, server := newRangeServer(t, size)
@@ -909,7 +923,7 @@ func TestOpenLTXFile_MultipartRetryBudget(t *testing.T) {
 			}
 
 			gets, _ := rs.stats()
-			if gets > 4*downloadPartRetries {
+			if gets > 2*downloadPartAttempts {
 				t.Fatalf("made %d requests for a part that never progresses; the budget is not binding", gets)
 			}
 
@@ -920,5 +934,90 @@ func TestOpenLTXFile_MultipartRetryBudget(t *testing.T) {
 				t.Fatalf("pool not drained after failure: readers=%d surplus=%d", r, s)
 			}
 		})
+	}
+}
+
+// TestOpenLTXFile_MultipartDribbleBudget verifies a backend that returns a
+// little data per connection cannot make a chunk open connections without
+// bound. Resetting the retry budget on any forward progress would let it open
+// one connection per byte, which is the churn benbjohnson/litestream#1500
+// identifies in the resumable reader; the budget is a lifetime count instead.
+func TestOpenLTXFile_MultipartDribbleBudget(t *testing.T) {
+	const (
+		partSize = 4096
+		size     = 40000
+	)
+
+	restore := downloadPartBackoff
+	downloadPartBackoff = time.Millisecond
+	t.Cleanup(func() { downloadPartBackoff = restore })
+
+	rs, server := newRangeServer(t, size)
+	// Every response after the first part carries a single byte, so each
+	// connection advances the chunk by one byte and never completes it.
+	rs.maxBody = 1
+
+	client, pool := newMultipartTestClient(t, server, 6, partSize)
+
+	rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(rc)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error once the attempt budget is exhausted")
+		}
+		if !strings.Contains(err.Error(), "download part") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("read did not terminate: the attempt budget is not bounded")
+	}
+
+	if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A budget that reset on progress would open one connection per byte.
+	if gets, _ := rs.stats(); gets > 4*downloadPartAttempts {
+		t.Fatalf("made %d requests for a dribbling chunk; the budget is not a lifetime count", gets)
+	}
+	if r, s, _ := poolStats(pool); r != 0 || s != 0 {
+		t.Fatalf("pool not drained: readers=%d surplus=%d", r, s)
+	}
+}
+
+// TestOpenLTXFile_MultipartCloseIsTerminal verifies a read after Close reports
+// the close rather than surfacing the cancelled context as a download failure.
+func TestOpenLTXFile_MultipartCloseIsTerminal(t *testing.T) {
+	const (
+		partSize = 1024
+		size     = 20000
+	)
+
+	_, server := newRangeServer(t, size)
+	client, _ := newMultipartTestClient(t, server, 6, partSize)
+
+	rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := rc.Read(make([]byte, 64)); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("read after close = %v, want os.ErrClosed", err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("second close = %v, want nil", err)
 	}
 }

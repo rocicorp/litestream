@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Default multipart download settings.
@@ -33,10 +34,22 @@ const (
 // always make forward progress without waiting on one of its peers.
 const minReaderChunks = 2
 
-// downloadPartRetries bounds the retries for a single chunk that is making no
-// forward progress. The budget resets whenever bytes are received, so a
-// connection that drops repeatedly but keeps advancing is not limited by it.
-const downloadPartRetries = 3
+// downloadPartAttempts bounds the connections opened for a single chunk.
+//
+// This is a lifetime budget rather than a consecutive-failure count that resets
+// on any forward progress. A backend that answers with one byte per connection
+// would otherwise have a chunk open one connection per byte and never let
+// backoff engage -- the churn that benbjohnson/litestream#1500 identifies in the
+// resumable reader. Six attempts still absorbs several disconnects in a chunk
+// that is otherwise progressing, since each attempt resumes from the last byte
+// received rather than restarting the chunk.
+const downloadPartAttempts = 6
+
+// downloadPartBackoff is the base delay between attempts, doubling each time.
+// Retrying with no delay lands every attempt inside the same provider throttle
+// window (e.g. Tigris 408 load shedding), spending the budget without giving the
+// provider a chance to recover. A var so tests can shorten it.
+var downloadPartBackoff = 250 * time.Millisecond
 
 // chunkPool is a bounded set of fixed-size buffers shared by every multipart
 // download in the process. Buffers are allocated on first use and recycled, so a
@@ -230,6 +243,7 @@ type multipartReader struct {
 	// Chunk 0 state. Only touched by the reading goroutine, as is err below.
 	live    io.ReadCloser
 	livePos int64
+	reopens int // connections opened for chunk 0; see downloadPartAttempts
 
 	mu        sync.Mutex
 	pending   map[int64]*downloadChunk
@@ -296,23 +310,41 @@ func (r *multipartReader) fetch(ch *downloadChunk) {
 	}
 
 	var off int64
-	for tries := 0; ; {
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 && !r.backoff(attempt) {
+			ch.err = fmt.Errorf("s3: download part %d of %s at offset %d: %w", ch.idx, r.key, start+off, r.ctx.Err())
+			return
+		}
+
+		// Each attempt resumes from the last byte received, so a chunk that
+		// keeps progressing across disconnects still completes.
 		n, err := r.c.readRange(r.ctx, r.key, start+off, length-off, ch.buf[off:length])
 		off += n
 		if off >= length {
 			ch.n = int(length)
 			return
 		}
-		if n > 0 {
-			tries = 0 // forward progress
-		}
 		if err == nil {
 			err = io.ErrUnexpectedEOF
 		}
-		if tries++; !r.retryable(err) || tries > downloadPartRetries {
+		if !r.retryable(err) || attempt+1 >= downloadPartAttempts {
 			ch.err = fmt.Errorf("s3: download part %d of %s at offset %d: %w", ch.idx, r.key, start+off, err)
 			return
 		}
+	}
+}
+
+// backoff waits out the delay for the given attempt, reporting false if the
+// download was cancelled first.
+func (r *multipartReader) backoff(attempt int) bool {
+	t := time.NewTimer(downloadPartBackoff << (attempt - 1))
+	defer t.Stop()
+
+	select {
+	case <-r.ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -326,6 +358,15 @@ func (r *multipartReader) retryable(err error) bool {
 func (r *multipartReader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
+	}
+
+	// Close is terminal: no stream is reopened afterwards and every later read
+	// reports it, rather than surfacing the cancelled context as a fetch error.
+	r.mu.Lock()
+	closed := r.closed
+	r.mu.Unlock()
+	if closed {
+		return 0, os.ErrClosed
 	}
 
 	// Chunk 0 streams directly from the response that opened the download.
@@ -399,16 +440,16 @@ func (r *multipartReader) retire() {
 // current offset if the stream breaks. Returning (0, nil) means chunk 0 has been
 // delivered in full and the pooled chunks take over.
 //
-// The retry budget is a local: it counts consecutive failures at one offset, and
-// any read that returns bytes returns from the function, so the next call starts
-// it over. A stream that drops repeatedly but keeps advancing is never limited.
+// reopens counts connections opened for this chunk over its lifetime, not
+// consecutive failures, for the reason given on downloadPartAttempts. It is a
+// field rather than a local because a read returning bytes returns from the
+// function, and the budget must survive into the next call.
 func (r *multipartReader) readLive(p []byte) (int, error) {
 	fail := func(err error) error {
 		r.err = fmt.Errorf("s3: download part 0 of %s at offset %d: %w", r.key, r.base+r.livePos, err)
 		return r.err
 	}
 
-	var tries int
 	for {
 		remain := r.partSize - r.livePos
 		if remain <= 0 {
@@ -419,9 +460,20 @@ func (r *multipartReader) readLive(p []byte) (int, error) {
 		}
 
 		if r.live == nil {
+			// The budget gates opening a connection, which is what it bounds.
+			// Checking it after a read instead would let a stream that dribbles
+			// a byte per connection return before the check is ever reached.
+			if r.reopens >= downloadPartAttempts {
+				return 0, fail(fmt.Errorf("%w after %d connections", io.ErrUnexpectedEOF, r.reopens))
+			}
+			if r.reopens > 0 && !r.backoff(r.reopens) {
+				return 0, fail(r.ctx.Err())
+			}
+			r.reopens++
+
 			rc, err := r.c.getRange(r.ctx, r.key, r.base+r.livePos, remain)
 			if err != nil {
-				if tries++; !r.retryable(err) || tries > downloadPartRetries {
+				if !r.retryable(err) {
 					return 0, fail(err)
 				}
 				continue
@@ -446,7 +498,7 @@ func (r *multipartReader) readLive(p []byte) (int, error) {
 		case err == io.EOF && r.livePos >= r.partSize:
 			return 0, nil // chunk 0 fully delivered
 		}
-		if tries++; !r.retryable(err) || tries > downloadPartRetries {
+		if !r.retryable(err) {
 			return 0, fail(err)
 		}
 	}
