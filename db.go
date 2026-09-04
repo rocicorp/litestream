@@ -544,6 +544,12 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 	db.maxLTXFileInfos.Unlock()
 
+	// NOTE: lastSyncedFrame is intentionally left untouched here. It is guarded
+	// by execSem, which this recovery path deliberately does not hold, so
+	// writing it would be a data race. It is safe to leave stale: after this
+	// reset the next sync sees pos.TXID == 0 and returns early from verify
+	// (first-sync path) without consulting lastSyncedFrame, then overwrites it.
+
 	db.invalidatePosCache()
 
 	db.Logger.Info("local state reset complete, next sync will create fresh snapshot")
@@ -2318,7 +2324,14 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	// back to the full scan. finalOffset is the next sync's info.offset, so its
 	// last frame — the one verify() will re-read — sits at finalOffset-frameSize.
 	if frameSize := int64(db.pageSize + WALFrameHeaderSize); finalOffset-frameSize > WALHeaderSize {
-		if fr, err := readWALFileAt(db.WALPath(), finalOffset-frameSize, frameSize); err == nil {
+		fr, err := readWALFileAt(db.WALPath(), finalOffset-frameSize, frameSize)
+		if err != nil {
+			// Leave nothing stale behind: clear the cache so the invariant stays
+			// "lastSyncedFrame is nil or reflects the most recent successful LTX
+			// write." The next verify() falls back to the full scan.
+			db.lastSyncedFrame = nil
+			db.Logger.Warn("could not read last WAL frame for lastSyncedFrame optimization", "error", err)
+		} else {
 			db.lastSyncedFrame = &syncedFrame{txid: txID, walOffset: finalOffset, frame: fr}
 		}
 	}
