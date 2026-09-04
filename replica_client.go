@@ -120,7 +120,7 @@ func fetchPageIndexData(ctx context.Context, client ReplicaClient, info *ltx.Fil
 		offset = 0
 	}
 
-	f, err := client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, offset, 0)
+	f, err := client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, offset, info.Size-offset)
 	if err != nil {
 		return nil, fmt.Errorf("open ltx file: %w", err)
 	}
@@ -144,7 +144,8 @@ func fetchPageIndexData(ctx context.Context, client ReplicaClient, info *ltx.Fil
 	}
 
 	// Otherwise read the file from the start of the page index.
-	f, err = client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, info.Size-ltx.TrailerSize-8-int64(size), 0)
+	indexOffset := info.Size - ltx.TrailerSize - 8 - int64(size)
+	f, err = client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, indexOffset, info.Size-indexOffset)
 	if err != nil {
 		return nil, fmt.Errorf("open ltx file: %w", err)
 	}

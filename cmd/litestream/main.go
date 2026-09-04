@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -1138,6 +1139,12 @@ type ReplicaSettings struct {
 	PartSize           *ByteSize `yaml:"part-size"`
 	Concurrency        *int      `yaml:"concurrency"`
 
+	// Multipart download settings. Independent of part-size/concurrency, which
+	// configure uploads. Set download-concurrency to 0 to disable multipart
+	// downloads.
+	DownloadPartSize    *ByteSize `yaml:"download-part-size"`
+	DownloadConcurrency *int      `yaml:"download-concurrency"`
+
 	// S3 Server-Side Encryption (SSE-C: Customer-provided keys)
 	SSECustomerAlgorithm string `yaml:"sse-customer-algorithm"`
 	SSECustomerKey       string `yaml:"sse-customer-key"`
@@ -1242,6 +1249,14 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if rs.StorageClass == "" {
 		rs.StorageClass = src.StorageClass
+	}
+	// Nil-preserving so an explicit per-replica `download-concurrency: 0`
+	// is not overwritten by a global value.
+	if rs.DownloadPartSize == nil {
+		rs.DownloadPartSize = src.DownloadPartSize
+	}
+	if rs.DownloadConcurrency == nil {
+		rs.DownloadConcurrency = src.DownloadConcurrency
 	}
 
 	// S3 SSE settings
@@ -1483,18 +1498,22 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	// Apply settings from URL, if specified.
 	var (
-		endpointWasSet         bool
-		usignPayload           bool
-		usignPayloadSet        bool
-		usignAcceptEncoding    bool
-		usignAcceptEncodingSet bool
-		urequireContentMD5     bool
-		urequireContentMD5Set  bool
-		ustorageClass          string
-		upartSize              int64
-		upartSizeSet           bool
-		uconcurrency           int64
-		uconcurrencySet        bool
+		endpointWasSet          bool
+		usignPayload            bool
+		usignPayloadSet         bool
+		usignAcceptEncoding     bool
+		usignAcceptEncodingSet  bool
+		urequireContentMD5      bool
+		urequireContentMD5Set   bool
+		ustorageClass           string
+		upartSize               int64
+		upartSizeSet            bool
+		uconcurrency            int64
+		uconcurrencySet         bool
+		udownloadPartSize       int64
+		udownloadPartSizeSet    bool
+		udownloadConcurrency    int64
+		udownloadConcurrencySet bool
 	)
 	if endpoint != "" {
 		endpointWasSet = true
@@ -1568,6 +1587,21 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		} else if ok {
 			uconcurrency = v
 			uconcurrencySet = true
+		}
+		if v, ok, err := litestream.IntQueryValue(query, "downloadPartSize", "download-part-size"); err != nil {
+			return nil, err
+		} else if ok {
+			udownloadPartSize = v
+			udownloadPartSizeSet = true
+		}
+		// Parsed by hand rather than with IntQueryValue: zero is a real value
+		// here (it disables multipart downloads), not "unset".
+		if raw := cmp.Or(query.Get("downloadConcurrency"), query.Get("download-concurrency")); raw != "" {
+			v, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || v < 0 {
+				return nil, fmt.Errorf("invalid value for query parameter \"download-concurrency\": %q (must be a non-negative integer)", raw)
+			}
+			udownloadConcurrency, udownloadConcurrencySet = v, true
 		}
 
 		// Only apply URL parts to field that have not been overridden.
@@ -1677,6 +1711,30 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	}
 	if c.Concurrency != nil {
 		client.Concurrency = *c.Concurrency
+	}
+
+	// Apply download configuration from URL query, then config overrides.
+	if udownloadPartSizeSet {
+		client.DownloadPartSize = udownloadPartSize
+	}
+	if udownloadConcurrencySet {
+		client.DownloadConcurrency = int(udownloadConcurrency)
+	}
+	// Validate before assigning so the YAML and URL forms share one contract:
+	// an out-of-range value is a configuration error, not a silent revert to the
+	// default (part size) or a silent disable (concurrency).
+	if c.DownloadPartSize != nil {
+		v := int64(*c.DownloadPartSize)
+		if v <= 0 {
+			return nil, fmt.Errorf("download-part-size must be a positive integer, got %d", v)
+		}
+		client.DownloadPartSize = v
+	}
+	if c.DownloadConcurrency != nil {
+		if *c.DownloadConcurrency < 0 {
+			return nil, fmt.Errorf("download-concurrency must not be negative, got %d", *c.DownloadConcurrency)
+		}
+		client.DownloadConcurrency = *c.DownloadConcurrency
 	}
 
 	// Apply SSE-C configuration if specified.

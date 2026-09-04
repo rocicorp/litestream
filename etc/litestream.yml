@@ -35,6 +35,23 @@
 #      # host-key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMvvypUkBrS9RCyV//p+UFCLg8yKNtTu/ew/cV6XXAAP
 #      # host-key: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ...
 
+# S3 transfer tuning (defaults shown). Uploads and downloads are configured
+# separately: the upload settings carry provider-specific overrides (Cloudflare
+# R2 caps upload concurrency at 2) that would needlessly throttle reads.
+#  - path: /path/to/primary/db
+#    replica:
+#      url: s3://my.bucket.com/db
+#      part-size: 5MiB                     # Multipart upload part size (default: 5MiB)
+#      concurrency: 5                      # Parallel upload parts (default: 5)
+#      # Files larger than download-part-size are fetched as several ranged GETs
+#      # in parallel. download-concurrency is the size of a chunk buffer pool
+#      # shared by every download in the process, not a per-file limit, so up to
+#      # download-concurrency * download-part-size bytes may be buffered. Set
+#      # download-concurrency to 0 to disable multipart downloads; a value
+#      # below 2 cannot seat a reader and is treated the same way.
+#      download-part-size:   16MiB         # default: 16MiB
+#      download-concurrency: 48            # default: 48
+
 # ------------------------------------------------------------------------------
 # Global options (defaults shown). All values below are commented out; they take
 # effect only when uncommented. The defaults are the values Litestream applies

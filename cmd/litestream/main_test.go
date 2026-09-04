@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
@@ -3974,4 +3975,222 @@ func waitForCondition(timeout time.Duration, fn func() bool) bool {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// TestS3ReplicaConfig_DownloadPartSizeAndConcurrency verifies the multipart
+// download settings are parsed from YAML and from the replica URL, and that
+// they stay independent of the upload settings.
+func TestS3ReplicaConfig_DownloadPartSizeAndConcurrency(t *testing.T) {
+	newClient := func(t *testing.T, yaml string) *s3.ReplicaClient {
+		t.Helper()
+
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(yaml[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(config.DBs) != 1 || len(config.DBs[0].Replicas) != 1 {
+			t.Fatal("expected one database with one replica")
+		}
+
+		r, err := main.NewReplicaFromConfig(config.DBs[0].Replicas[0], nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, ok := r.Client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatal("expected S3 replica client")
+		}
+		return client
+	}
+
+	t.Run("Defaults", func(t *testing.T) {
+		client := newClient(t, `
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+`)
+		if got, want := client.DownloadPartSize, int64(s3.DefaultDownloadPartSize); got != want {
+			t.Errorf("DownloadPartSize = %d, want %d", got, want)
+		}
+		if got, want := client.DownloadConcurrency, s3.DefaultDownloadConcurrency; got != want {
+			t.Errorf("DownloadConcurrency = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("FromYAML", func(t *testing.T) {
+		client := newClient(t, `
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+        part-size: 5MiB
+        concurrency: 3
+        download-part-size: 32MiB
+        download-concurrency: 12
+`)
+		if got, want := client.DownloadPartSize, int64(32*1024*1024); got != want {
+			t.Errorf("DownloadPartSize = %d, want %d", got, want)
+		}
+		if got, want := client.DownloadConcurrency, 12; got != want {
+			t.Errorf("DownloadConcurrency = %d, want %d", got, want)
+		}
+		// Upload settings must be untouched by the download settings.
+		if got, want := client.PartSize, int64(5*1024*1024); got != want {
+			t.Errorf("PartSize = %d, want %d", got, want)
+		}
+		if got, want := client.Concurrency, 3; got != want {
+			t.Errorf("Concurrency = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("FromURL", func(t *testing.T) {
+		client := newClient(t, `
+dbs:
+  - path: /path/to/db
+    replicas:
+      - url: s3://mybucket/mypath?region=us-east-1&download-part-size=1048576&download-concurrency=6
+`)
+		if got, want := client.DownloadPartSize, int64(1048576); got != want {
+			t.Errorf("DownloadPartSize = %d, want %d", got, want)
+		}
+		if got, want := client.DownloadConcurrency, 6; got != want {
+			t.Errorf("DownloadConcurrency = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("Disabled", func(t *testing.T) {
+		client := newClient(t, `
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+        download-concurrency: 0
+`)
+		if got, want := client.DownloadConcurrency, 0; got != want {
+			t.Errorf("DownloadConcurrency = %d, want %d", got, want)
+		}
+	})
+}
+
+// TestS3ReplicaConfig_DownloadValidation verifies the YAML form rejects the same
+// values the URL form rejects, rather than silently reverting to the default or
+// silently disabling multipart.
+func TestS3ReplicaConfig_DownloadValidation(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		setting string
+		wantErr string
+	}{
+		{name: "ZeroPartSize", setting: "download-part-size: 0", wantErr: "download-part-size must be a positive integer"},
+		{name: "NegativePartSize", setting: "download-part-size: -1", wantErr: "download-part-size must be a positive integer"},
+		{name: "NegativeConcurrency", setting: "download-concurrency: -1", wantErr: "download-concurrency must not be negative"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			filename := filepath.Join(t.TempDir(), "litestream.yml")
+			config := fmt.Sprintf(`
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+        %s
+`[1:], tt.setting)
+			if err := os.WriteFile(filename, []byte(config), 0666); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, err := main.ReadConfigFile(filename, false)
+			if err != nil {
+				// Some values are rejected while unmarshalling; that is fine as
+				// long as the failure is reported rather than swallowed.
+				return
+			}
+			if _, err := main.NewReplicaFromConfig(cfg.DBs[0].Replicas[0], nil); err == nil {
+				t.Fatal("expected a configuration error")
+			} else if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error %q does not mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestS3ReplicaConfig_DownloadGlobalInheritance verifies top-level download
+// settings reach each replica, and that an explicit per-replica value -- zero
+// included -- still wins.
+func TestS3ReplicaConfig_DownloadGlobalInheritance(t *testing.T) {
+	newClient := func(t *testing.T, body string) *s3.ReplicaClient {
+		t.Helper()
+
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(body[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := main.NewReplicaFromConfig(cfg.DBs[0].Replicas[0], nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, ok := r.Client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatal("expected S3 replica client")
+		}
+		return client
+	}
+
+	t.Run("Inherited", func(t *testing.T) {
+		client := newClient(t, `
+download-part-size: 32MiB
+download-concurrency: 12
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+`)
+		if got, want := client.DownloadPartSize, int64(32*1024*1024); got != want {
+			t.Errorf("DownloadPartSize = %d, want %d (global value ignored)", got, want)
+		}
+		if got, want := client.DownloadConcurrency, 12; got != want {
+			t.Errorf("DownloadConcurrency = %d, want %d (global value ignored)", got, want)
+		}
+	})
+
+	t.Run("ReplicaOverridesWithZero", func(t *testing.T) {
+		client := newClient(t, `
+download-concurrency: 12
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+        download-concurrency: 0
+`)
+		if got := client.DownloadConcurrency; got != 0 {
+			t.Errorf("DownloadConcurrency = %d, want 0 (explicit replica zero overridden by global)", got)
+		}
+	})
 }
