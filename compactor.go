@@ -109,6 +109,25 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		return nil, fmt.Errorf("cannot determine max ltx file for destination level: %w", err)
 	}
 	seekTXID := prevMaxInfo.MaxTXID + 1
+	if prevMaxInfo.MaxTXID == 0 { // destination level never populated
+		// Skip everything already captured in the snapshot. MaxLTXFileInfo is the
+		// same helper used for dstLevel above; SnapshotLevel is already in scope.
+		snapInfo, err := c.MaxLTXFileInfo(ctx, SnapshotLevel)
+		if err != nil {
+			return nil, fmt.Errorf("cannot determine snapshot max ltx file: %w", err)
+		}
+		if snapInfo.MaxTXID == 0 {
+			// No snapshot yet. Defer rather than fall back to seeking from TXID 1,
+			// which would re-include the DB-sized base in this level's first
+			// compaction. The snapshot and each compaction level run in independent
+			// monitors with no ordering guarantee, so a ladder level can reach this
+			// point before the snapshot exists; wait until it does. This is
+			// deadlock-free because the snapshot is produced by reading the live DB,
+			// not by compacting this ladder, so it always eventually lands.
+			return nil, ErrNoCompaction
+		}
+		seekTXID = snapInfo.MaxTXID + 1
+	}
 
 	itr, err := c.client.LTXFiles(ctx, srcLevel, seekTXID, false)
 	if err != nil {

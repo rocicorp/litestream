@@ -23,9 +23,11 @@ func TestCompactor_Compact(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())
 
-		// Create test L0 files
-		createTestLTXFile(t, client, 0, 1, 1)
+		// The base is captured in the snapshot at TXID 1; L0 holds increments
+		// from TXID 2 onward. Compaction into the empty L1 seeks from snapMax+1.
+		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
 		createTestLTXFile(t, client, 0, 2, 2)
+		createTestLTXFile(t, client, 0, 3, 3)
 
 		info, err := compactor.Compact(context.Background(), 1)
 		if err != nil {
@@ -34,8 +36,8 @@ func TestCompactor_Compact(t *testing.T) {
 		if info.Level != 1 {
 			t.Errorf("Level=%d, want 1", info.Level)
 		}
-		if info.MinTXID != 1 || info.MaxTXID != 2 {
-			t.Errorf("TXID range=%d-%d, want 1-2", info.MinTXID, info.MaxTXID)
+		if info.MinTXID != 2 || info.MaxTXID != 3 {
+			t.Errorf("TXID range=%d-%d, want 2-3", info.MinTXID, info.MaxTXID)
 		}
 	})
 
@@ -53,29 +55,30 @@ func TestCompactor_Compact(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())
 
-		// Create L0 files
-		createTestLTXFile(t, client, 0, 1, 1)
+		// Base in the snapshot at TXID 1; L0 increments from TXID 2.
+		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
 		createTestLTXFile(t, client, 0, 2, 2)
+		createTestLTXFile(t, client, 0, 3, 3)
 
-		// Compact to L1
+		// Compact to L1 (seeks from snapMax+1 = 2)
 		_, err := compactor.Compact(context.Background(), 1)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		// Create more L0 files
-		createTestLTXFile(t, client, 0, 3, 3)
+		createTestLTXFile(t, client, 0, 4, 4)
 
-		// Compact to L1 again (should only include TXID 3)
+		// Compact to L1 again (should only include TXID 4)
 		info, err := compactor.Compact(context.Background(), 1)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.MinTXID != 3 || info.MaxTXID != 3 {
-			t.Errorf("TXID range=%d-%d, want 3-3", info.MinTXID, info.MaxTXID)
+		if info.MinTXID != 4 || info.MaxTXID != 4 {
+			t.Errorf("TXID range=%d-%d, want 4-4", info.MinTXID, info.MaxTXID)
 		}
 
-		// Now compact L1 to L2 (should include all from 1-3)
+		// Now compact L1 to L2 (empty L2 seeks from snapMax+1 = 2, pulling all L1)
 		info, err = compactor.Compact(context.Background(), 2)
 		if err != nil {
 			t.Fatal(err)
@@ -83,8 +86,114 @@ func TestCompactor_Compact(t *testing.T) {
 		if info.Level != 2 {
 			t.Errorf("Level=%d, want 2", info.Level)
 		}
-		if info.MinTXID != 1 || info.MaxTXID != 3 {
-			t.Errorf("TXID range=%d-%d, want 1-3", info.MinTXID, info.MaxTXID)
+		if info.MinTXID != 2 || info.MaxTXID != 4 {
+			t.Errorf("TXID range=%d-%d, want 2-4", info.MinTXID, info.MaxTXID)
+		}
+	})
+}
+
+func TestCompactor_Compact_SeeksFromSnapshot(t *testing.T) {
+	t.Run("EmptyDestinationSkipsSnapshottedRange", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// A snapshot already covers TXID 1-5.
+		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 5)
+
+		// L0 has the snapshotted range plus new increments.
+		createTestLTXFile(t, client, 0, 1, 5)
+		createTestLTXFile(t, client, 0, 6, 6)
+		createTestLTXFile(t, client, 0, 7, 7)
+
+		// L1 has never been compacted (empty destination): should seek from
+		// snapMax+1 rather than TXID 1, skipping the file already captured
+		// in the snapshot.
+		info, err := compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 6 || info.MaxTXID != 7 {
+			t.Errorf("TXID range=%d-%d, want 6-7", info.MinTXID, info.MaxTXID)
+		}
+	})
+
+	t.Run("NoSnapshotDefers", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// No snapshot exists yet. An empty destination must DEFER (ErrNoCompaction)
+		// rather than seek from TXID 1, which would re-include the DB-sized base in
+		// the ladder's first compaction. The snapshot and ladder levels run in
+		// independent monitors with no ordering guarantee, so a ladder level can
+		// reach Compact before the snapshot lands; it should wait.
+		createTestLTXFile(t, client, 0, 1, 1)
+		createTestLTXFile(t, client, 0, 2, 2)
+
+		if _, err := compactor.Compact(context.Background(), 1); err != litestream.ErrNoCompaction {
+			t.Errorf("err=%v, want ErrNoCompaction", err)
+		}
+	})
+
+	t.Run("DefersThenProceedsOnceSnapshotLands", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// L0 base + increment, but no snapshot yet: the first compaction defers.
+		createTestLTXFile(t, client, 0, 1, 1)
+		createTestLTXFile(t, client, 0, 2, 2)
+		if _, err := compactor.Compact(context.Background(), 1); err != litestream.ErrNoCompaction {
+			t.Fatalf("err=%v, want ErrNoCompaction before snapshot exists", err)
+		}
+
+		// Once the snapshot lands (covering the base at TXID 1), the same empty
+		// destination proceeds, seeking from snapMax+1 and skipping the base.
+		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
+		info, err := compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 2 || info.MaxTXID != 2 {
+			t.Errorf("TXID range=%d-%d, want 2-2 (base skipped, seek from snapMax+1)", info.MinTXID, info.MaxTXID)
+		}
+	})
+
+	t.Run("NonEmptyDestinationIgnoresLeapfroggingSnapshot", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// A base snapshot must exist for the empty-destination first compaction to
+		// proceed (an empty destination now defers until the snapshot lands).
+		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
+
+		// L1 already has files up through TXID 3 (seeded from snapMax+1 = 2).
+		createTestLTXFile(t, client, 0, 1, 1)
+		createTestLTXFile(t, client, 0, 2, 2)
+		createTestLTXFile(t, client, 0, 3, 3)
+		if _, err := compactor.Compact(context.Background(), 1); err != nil {
+			t.Fatal(err)
+		}
+
+		// A later periodic snapshot leapfrogs past the current L1 head.
+		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 10)
+
+		// New L0 increments continue contiguously from L1's existing head,
+		// not from the snapshot.
+		createTestLTXFile(t, client, 0, 4, 4)
+
+		// Destination (L1) is non-empty, so the snapshot floor must NOT be
+		// applied here -- only the prevMaxInfo+1 seek is used. Using the
+		// snapshot floor would skip TXID 4 and open a gap once TXID 11
+		// eventually arrives.
+		info, err := compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 4 || info.MaxTXID != 4 {
+			t.Errorf("TXID range=%d-%d, want 4-4 (leapfrogging snapshot must not create a gap)", info.MinTXID, info.MaxTXID)
+		}
+
+		if err := compactor.VerifyLevelConsistency(context.Background(), 1); err != nil {
+			t.Errorf("expected contiguous L1 after leapfrogging snapshot, got: %v", err)
 		}
 	})
 }
@@ -93,8 +202,9 @@ func TestCompactor_CompactClosesPipeOnWriteError(t *testing.T) {
 	client := newEarlyReturnCompactionClient(t.TempDir())
 	compactor := litestream.NewCompactor(client, slog.Default())
 
-	createTestLTXFile(t, client, 0, 1, 1)
+	createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
 	createTestLTXFile(t, client, 0, 2, 2)
+	createTestLTXFile(t, client, 0, 3, 3)
 	client.failWrites = true
 
 	before := countCompactorPipeWriters()
@@ -124,7 +234,8 @@ func TestCompactor_CompactResumesRemoteSourceAfterDisconnect(t *testing.T) {
 	client := newDisconnectingCompactionClient(t.TempDir(), 16)
 	compactor := litestream.NewCompactor(client, slog.Default())
 
-	createTestLTXFile(t, client, 0, 1, 1)
+	createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
+	createTestLTXFile(t, client, 0, 2, 2)
 
 	info, err := compactor.Compact(context.Background(), 1)
 	if err != nil {
@@ -133,8 +244,8 @@ func TestCompactor_CompactResumesRemoteSourceAfterDisconnect(t *testing.T) {
 	if info.Level != 1 {
 		t.Errorf("Level=%d, want 1", info.Level)
 	}
-	if info.MinTXID != 1 || info.MaxTXID != 1 {
-		t.Errorf("TXID range=%d-%d, want 1-1", info.MinTXID, info.MaxTXID)
+	if info.MinTXID != 2 || info.MaxTXID != 2 {
+		t.Errorf("TXID range=%d-%d, want 2-2", info.MinTXID, info.MaxTXID)
 	}
 
 	var resumed bool
@@ -286,10 +397,11 @@ func TestCompactor_EnforceL0Retention(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())
 
-		// Create L0 files
-		createTestLTXFile(t, client, 0, 1, 1)
+		// Base in the snapshot; L0 increments from TXID 2.
+		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
 		createTestLTXFile(t, client, 0, 2, 2)
 		createTestLTXFile(t, client, 0, 3, 3)
+		createTestLTXFile(t, client, 0, 4, 4)
 
 		// Compact to L1
 		_, err := compactor.Compact(context.Background(), 1)
@@ -478,11 +590,12 @@ func TestCompactor_EnforceL0Retention_RetentionDisabled(t *testing.T) {
 		return nil
 	}
 
-	// Create L0 files with old timestamps so they're eligible for deletion.
+	// Base in the snapshot; L0 increments (old timestamps) from TXID 2.
 	oldTime := time.Now().Add(-1 * time.Hour)
-	createTestLTXFileWithTimestamp(t, client, 0, 1, 1, oldTime)
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 1, oldTime)
 	createTestLTXFileWithTimestamp(t, client, 0, 2, 2, oldTime)
 	createTestLTXFileWithTimestamp(t, client, 0, 3, 3, oldTime)
+	createTestLTXFileWithTimestamp(t, client, 0, 4, 4, oldTime)
 
 	// Compact to L1 first.
 	_, err := compactor.Compact(context.Background(), 1)
@@ -599,10 +712,11 @@ func TestCompactor_CompactWithVerification(t *testing.T) {
 		compactor := litestream.NewCompactor(client, slog.Default())
 		compactor.VerifyCompaction = true
 
-		// Create contiguous L0 files
-		createTestLTXFile(t, client, 0, 1, 1)
+		// Base in the snapshot; contiguous L0 increments from TXID 2.
+		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
 		createTestLTXFile(t, client, 0, 2, 2)
 		createTestLTXFile(t, client, 0, 3, 3)
+		createTestLTXFile(t, client, 0, 4, 4)
 
 		// Compact to L1 - should succeed with verification
 		info, err := compactor.Compact(context.Background(), 1)
@@ -612,8 +726,8 @@ func TestCompactor_CompactWithVerification(t *testing.T) {
 		if info.Level != 1 {
 			t.Errorf("Level=%d, want 1", info.Level)
 		}
-		if info.MinTXID != 1 || info.MaxTXID != 3 {
-			t.Errorf("TXID range=%d-%d, want 1-3", info.MinTXID, info.MaxTXID)
+		if info.MinTXID != 2 || info.MaxTXID != 4 {
+			t.Errorf("TXID range=%d-%d, want 2-4", info.MinTXID, info.MaxTXID)
 		}
 	})
 }
@@ -746,8 +860,9 @@ func TestCompactor_CompactPassesFileSize(t *testing.T) {
 	client := &recordingCompactionClient{ReplicaClient: file.NewReplicaClient(t.TempDir())}
 	compactor := litestream.NewCompactor(client, slog.Default())
 
-	createTestLTXFile(t, client, 0, 1, 1)
+	createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
 	createTestLTXFile(t, client, 0, 2, 2)
+	createTestLTXFile(t, client, 0, 3, 3)
 
 	// Record the true sizes before compacting.
 	want := make(map[ltx.TXID]int64)

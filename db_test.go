@@ -414,6 +414,12 @@ func TestDB_Compact(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// Capture the base at the snapshot level so the ladder seeks from
+		// snapMax+1 (an empty destination defers until the snapshot exists).
+		if _, err := db.Snapshot(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
 		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
@@ -436,7 +442,7 @@ func TestDB_Compact(t *testing.T) {
 		if got, want := info.Level, 1; got != want {
 			t.Fatalf("Level=%v, want %v", got, want)
 		}
-		if got, want := info.MinTXID, ltx.TXID(1); got != want {
+		if got, want := info.MinTXID, ltx.TXID(2); got != want {
 			t.Fatalf("MinTXID=%s, want %s", got, want)
 		}
 		if got, want := info.MaxTXID, ltx.TXID(2); got != want {
@@ -456,6 +462,12 @@ func TestDB_Compact(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// Capture the base at the snapshot level so the ladder seeks from
+		// snapMax+1 (an empty destination defers until the snapshot exists).
+		if _, err := db.Snapshot(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
 		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
@@ -471,10 +483,10 @@ func TestDB_Compact(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Compact to L1:1-2
+		// Compact to L1:2-2 (base TXID 1 is in the snapshot; L1 seeks from 2)
 		if info, err := db.Compact(t.Context(), 1); err != nil {
 			t.Fatal(err)
-		} else if got, want := ltx.FormatFilename(info.MinTXID, info.MaxTXID), `0000000000000001-0000000000000002.ltx`; got != want {
+		} else if got, want := ltx.FormatFilename(info.MinTXID, info.MaxTXID), `0000000000000002-0000000000000002.ltx`; got != want {
 			t.Fatalf("Filename=%s, want %s", got, want)
 		}
 
@@ -496,12 +508,12 @@ func TestDB_Compact(t *testing.T) {
 			t.Fatalf("Filename=%s, want %s", got, want)
 		}
 
-		// Compact to L2:1-3
+		// Compact to L2:2-3 (base TXID 1 is in the snapshot; L2 seeks from 2)
 		if info, err := db.Compact(t.Context(), 2); err != nil {
 			t.Fatal(err)
 		} else if got, want := info.Level, 2; got != want {
 			t.Fatalf("Level=%v, want %v", got, want)
-		} else if got, want := ltx.FormatFilename(info.MinTXID, info.MaxTXID), `0000000000000001-0000000000000003.ltx`; got != want {
+		} else if got, want := ltx.FormatFilename(info.MinTXID, info.MaxTXID), `0000000000000002-0000000000000003.ltx`; got != want {
 			t.Fatalf("Filename=%s, want %s", got, want)
 		}
 	})
@@ -891,6 +903,14 @@ func TestDB_EnforceL0RetentionByTime_RetentionDisabled(t *testing.T) {
 	} else if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+
+	// Capture the base at the snapshot level so the ladder seeks from snapMax+1
+	// (an empty destination defers until the snapshot exists). The inserts below
+	// become L0 increments above the snapshot for L1 to compact.
+	if _, err := db.Snapshot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
 	for i := 0; i < 3; i++ {
 		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
 			t.Fatal(err)
@@ -1042,6 +1062,19 @@ func TestCompaction_PreservesLastTimestamp(t *testing.T) {
 	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
 	defer testingutil.MustCloseDBs(t, db, sqldb)
 
+	// Seed a base transaction and capture it at the snapshot level so the ladder
+	// has a floor to seek from (an empty destination defers until the snapshot
+	// exists). The loop below adds L0 increments above the snapshot.
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+		t.Fatalf("seed create table: %v", err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("seed sync: %v", err)
+	}
+	if _, err := db.Snapshot(ctx); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
 	// Create some transactions
 	for i := 0; i < 10; i++ {
 		if _, err := sqldb.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
@@ -1160,6 +1193,16 @@ func TestDB_EnforceRetentionByTXID_LocalCleanup(t *testing.T) {
 		t.Fatalf("create table: %v", err)
 	}
 
+	// Capture the base at the snapshot level so the ladder seeks from snapMax+1
+	// (an empty destination defers until the snapshot exists). The batches below
+	// become L0 increments above the snapshot.
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("seed sync: %v", err)
+	}
+	if _, err := db.Snapshot(ctx); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
 	type localFile struct {
 		path    string
 		minTXID ltx.TXID
@@ -1256,6 +1299,16 @@ func TestDB_EnforceL0RetentionByTime(t *testing.T) {
 
 	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
 		t.Fatalf("create table: %v", err)
+	}
+
+	// Capture the base at the snapshot level so the ladder seeks from snapMax+1
+	// (an empty destination defers until the snapshot exists). The inserts below
+	// become L0 increments above the snapshot.
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("seed sync: %v", err)
+	}
+	if _, err := db.Snapshot(ctx); err != nil {
+		t.Fatalf("snapshot: %v", err)
 	}
 
 	for i := 0; i < 3; i++ {

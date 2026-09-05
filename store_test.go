@@ -107,6 +107,21 @@ func TestStore_CompactDB(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// Capture the base at the snapshot level so the ladder has a floor to
+		// seek from; an empty destination defers until the snapshot exists.
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); err != nil {
+			t.Fatal(err)
+		}
+
+		// A further write produces an L0 increment above the snapshot for L1.
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (200)`); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
 		_, err := s.CompactDB(t.Context(), db0, levels[1])
 		require.NoError(t, err)
 

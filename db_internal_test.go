@@ -1792,6 +1792,16 @@ func TestDB_L0RetentionMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Capture the base at the snapshot level so the ladder seeks from snapMax+1
+	// (an empty destination defers until the snapshot exists). The inserts below
+	// become L0 increments above the snapshot.
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
 	for i := range 3 {
 		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, 'data')`, i); err != nil {
 			t.Fatal(err)

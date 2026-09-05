@@ -68,7 +68,19 @@ func TestStore_CompactDB_RemotePartialRead(t *testing.T) {
 		}
 	}
 
-	// Generate two consecutive L0 files.
+	// Capture the base (schema) at the snapshot level so the ladder has a floor
+	// to seek from; an empty destination defers until the snapshot exists.
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("sync base: %v", err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatalf("replica sync base: %v", err)
+	}
+	if _, err := store.CompactDB(ctx, db, store.SnapshotLevel()); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	// Generate two consecutive L0 files above the snapshot.
 	insert(0, 256)
 	if err := db.Sync(ctx); err != nil {
 		t.Fatalf("sync #1: %v", err)
