@@ -162,10 +162,33 @@ func newMultipartTestClient(t *testing.T, server *httptest.Server, poolSize int,
 	return client, client.pool
 }
 
-func poolStats(p *chunkPool) (readers, surplus, free int) {
+func poolStats(p *chunkPool) (readers, held, free int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.readers, p.surplus, len(p.free)
+	return p.readers, p.held, len(p.free)
+}
+
+// leaseHeld returns the number of pool buffers rc currently holds.
+func leaseHeld(t *testing.T, rc io.ReadCloser) int {
+	t.Helper()
+
+	r, ok := rc.(*multipartReader)
+	if !ok {
+		t.Fatalf("reader is %T, not a multipartReader", rc)
+	}
+	r.lease.pool.mu.Lock()
+	defer r.lease.pool.mu.Unlock()
+	return r.lease.held
+}
+
+// requestsPerChunk groups the ranges rs served by the chunk they fall in.
+func requestsPerChunk(rs *rangeServer, partSize int64) map[int64]int {
+	_, starts := rs.stats()
+	per := make(map[int64]int)
+	for _, start := range starts {
+		per[start/partSize]++
+	}
+	return per
 }
 
 // readWithChunks reads rc in randomly sized pieces to exercise partial reads
@@ -232,9 +255,9 @@ func TestOpenLTXFile_MultipartRoundTrip(t *testing.T) {
 				t.Fatalf("GET count = %d; the parallel path was not taken", gets)
 			}
 
-			readers, surplus, free := poolStats(pool)
-			if readers != 0 || surplus != 0 {
-				t.Fatalf("pool not drained: readers=%d surplus=%d", readers, surplus)
+			readers, held, free := poolStats(pool)
+			if readers != 0 || held != 0 {
+				t.Fatalf("pool not drained: readers=%d held=%d", readers, held)
 			}
 			if free > tt.poolSize {
 				t.Fatalf("pool holds %d buffers, size is %d", free, tt.poolSize)
@@ -310,18 +333,20 @@ func TestOpenLTXFile_MultipartDisabled(t *testing.T) {
 // TestOpenLTXFile_MultipartLockstep is the head-of-line blocking test. It
 // mirrors what ltx.Compactor does during a restore: every file in the plan is
 // opened up front and then drained from a single goroutine in round-robin
-// order. The pool is sized so that all readers together hold exactly their
-// reservations and nothing more, which is the tightest case for deadlock.
+// order. The pool holds fewer buffers than there are readers, so at any moment
+// some of them have no look-ahead at all and must stream; a reader that could
+// wait on a buffer held by a peer would hang this forever.
 func TestOpenLTXFile_MultipartLockstep(t *testing.T) {
 	const (
 		nreaders = 4
+		poolSize = 3
 		partSize = 512
 		size     = 40000
 	)
 
 	servers := make([]*rangeServer, nreaders)
 	readers := make([]io.ReadCloser, nreaders)
-	pool := newChunkPool(nreaders*minReaderChunks, partSize)
+	pool := newChunkPool(poolSize, partSize)
 
 	for i := range nreaders {
 		rs, server := newRangeServer(t, size)
@@ -334,7 +359,7 @@ func TestOpenLTXFile_MultipartLockstep(t *testing.T) {
 
 		client := newTestReplicaClient(t, server)
 		client.DownloadPartSize = partSize
-		client.DownloadConcurrency = nreaders * minReaderChunks
+		client.DownloadConcurrency = poolSize
 		client.pool = pool
 
 		rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
@@ -379,17 +404,18 @@ func TestOpenLTXFile_MultipartLockstep(t *testing.T) {
 	}
 
 	if r, s, _ := poolStats(pool); r != 0 || s != 0 {
-		t.Fatalf("pool not drained: readers=%d surplus=%d", r, s)
+		t.Fatalf("pool not drained: readers=%d held=%d", r, s)
 	}
 }
 
-// TestOpenLTXFile_MultipartPoolSaturated verifies that readers beyond the pool's
-// capacity fall back to a single stream instead of waiting for a buffer.
-func TestOpenLTXFile_MultipartPoolSaturated(t *testing.T) {
+// TestOpenLTXFile_MultipartPoolExhausted verifies that readers arriving at a
+// pool with no buffer to spare still register, still complete, and stream their
+// chunks instead of waiting for a peer to release one.
+func TestOpenLTXFile_MultipartPoolExhausted(t *testing.T) {
 	const (
 		partSize = 512
 		size     = 20000
-		poolSize = 4 // room for exactly two registrations
+		poolSize = 2
 	)
 
 	pool := newChunkPool(poolSize, partSize)
@@ -412,14 +438,18 @@ func TestOpenLTXFile_MultipartPoolSaturated(t *testing.T) {
 		readers[i] = rc
 	}
 
-	if r, _, _ := poolStats(pool); r != 2 {
-		t.Fatalf("registered readers = %d, want 2", r)
+	if r, held, _ := poolStats(pool); r != 3 || held != poolSize {
+		t.Fatalf("registered readers = %d, held = %d; want 3 readers holding %d", r, held, poolSize)
 	}
-
-	// The third reader could not register, but it keeps the part already in
-	// flight: one GET so far, and the continuation only once that is drained.
-	if gets, _ := servers[2].stats(); gets != 1 {
-		t.Fatalf("fallback reader made %d GETs before reading, want 1", gets)
+	// The first reader took the whole pool; the later ones have only their
+	// live chunk 0 in flight and made no other request.
+	if got := leaseHeld(t, readers[0]); got != poolSize {
+		t.Fatalf("first reader holds %d buffers, want %d", got, poolSize)
+	}
+	for i := 1; i < 3; i++ {
+		if gets, _ := servers[i].stats(); gets != 1 {
+			t.Fatalf("reader %d made %d GETs before reading, want 1", i, gets)
+		}
 	}
 
 	for i := range 3 {
@@ -433,6 +463,9 @@ func TestOpenLTXFile_MultipartPoolSaturated(t *testing.T) {
 		if !bytes.Equal(got, servers[i].data) {
 			t.Fatalf("reader %d: data mismatch", i)
 		}
+	}
+	if r, held, _ := poolStats(pool); r != 0 || held != 0 {
+		t.Fatalf("pool not drained: readers=%d held=%d", r, held)
 	}
 }
 
@@ -521,7 +554,7 @@ func TestOpenLTXFile_MultipartPartRetry(t *testing.T) {
 				t.Fatalf("got %d bytes, want %d", len(got), len(rs.data))
 			}
 			if r, s, _ := poolStats(pool); r != 0 || s != 0 {
-				t.Fatalf("pool not drained: readers=%d surplus=%d", r, s)
+				t.Fatalf("pool not drained: readers=%d held=%d", r, s)
 			}
 		})
 	}
@@ -557,101 +590,242 @@ func TestOpenLTXFile_MultipartCloseReleasesBuffers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if readers, surplus, _ := poolStats(pool); readers != 0 || surplus != 0 {
-		t.Fatalf("pool not drained: readers=%d surplus=%d", readers, surplus)
+	if readers, held, _ := poolStats(pool); readers != 0 || held != 0 {
+		t.Fatalf("pool not drained: readers=%d held=%d", readers, held)
 	}
 
 	// The pool is fully usable again.
-	if lease := pool.register(); lease == nil {
-		t.Fatal("cannot register after close")
+	l := pool.register(1)
+	if buf := l.acquire(); buf == nil {
+		t.Fatal("cannot acquire after close")
 	} else {
-		lease.close()
+		l.release(buf)
 	}
+	l.close()
 }
 
-// TestChunkPool_RampLeavesRoomToRegister verifies a reader cannot hoard the pool
-// before its peers have registered: until it has retired chunks it is held to
-// its reservation, so a pool sized for N readers really does admit N.
-func TestChunkPool_RampLeavesRoomToRegister(t *testing.T) {
-	const readers = 4
-	p := newChunkPool(readers*minReaderChunks, 16)
-
-	first := p.register()
-	if first == nil {
-		t.Fatal("first register failed")
-	}
-
+// drain acquires until the lease is refused and returns what it got.
+func drain(l *chunkLease) [][]byte {
 	var held [][]byte
 	for {
-		buf := first.acquire()
+		buf := l.acquire()
 		if buf == nil {
-			break
+			return held
 		}
 		held = append(held, buf)
 	}
-	if got, want := len(held), minReaderChunks; got != want {
-		t.Fatalf("un-ramped reader held %d buffers, want %d", got, want)
+}
+
+// TestChunkPool_ShareIsProportional verifies the pool is split by how much of
+// each file remains rather than evenly. This is the shape of a real restore
+// plan -- one snapshot that is nearly all of the bytes, plus many incremental
+// files the compactor drains at a trickle -- and an even split would leave the
+// snapshot with a sliver of the pool for the whole restore.
+func TestChunkPool_ShareIsProportional(t *testing.T) {
+	const (
+		poolSize    = 48
+		bigChunks   = 3840 // a 60 GiB snapshot at 16 MiB parts
+		smallChunks = 3    // a 50 MiB incremental
+		nsmall      = 30
+	)
+	p := newChunkPool(poolSize, 16)
+
+	// A lone reader may take the whole pool.
+	big := p.register(bigChunks)
+	if got := p.shareLocked(big); got != poolSize {
+		t.Fatalf("lone reader share = %d, want %d", got, poolSize)
 	}
 
-	// The rest of the readers the pool was sized for still fit.
-	leases := []*chunkLease{first}
-	for i := 1; i < readers; i++ {
-		l := p.register()
-		if l == nil {
-			t.Fatalf("register %d failed with %d buffers outstanding", i+1, len(held))
-		}
-		leases = append(leases, l)
+	// With small peers registered the snapshot keeps nearly all of it, and
+	// each small file is still allowed one buffer of look-ahead.
+	smalls := make([]*chunkLease, nsmall)
+	for i := range smalls {
+		smalls[i] = p.register(smallChunks)
 	}
-	if l := p.register(); l != nil {
-		t.Fatal("expected registration to fail once reservations are exhausted")
+	if got := p.shareLocked(big); got != 47 {
+		t.Fatalf("snapshot share with %d small peers = %d, want 47", nsmall, got)
+	}
+	if got := p.shareLocked(smalls[0]); got != 1 {
+		t.Fatalf("small reader share = %d, want 1", got)
 	}
 
-	// Every registered reader can still obtain its reservation.
-	for _, l := range leases[1:] {
-		for range minReaderChunks {
-			if buf := l.acquire(); buf == nil {
-				t.Fatal("registered reader could not obtain its reservation")
-			} else {
-				held = append(held, buf)
-			}
-		}
+	// Rounded-up shares exceed the pool on paper; the pool's bound still holds.
+	held := drain(big)
+	if len(held) != 47 {
+		t.Fatalf("snapshot acquired %d buffers, want 47", len(held))
 	}
-	if _, surplus, _ := poolStats(p); surplus != 0 {
-		t.Fatalf("surplus=%d, want 0", surplus)
+	for _, l := range smalls {
+		held = append(held, drain(l)...)
+	}
+	if len(held) != poolSize {
+		t.Fatalf("total acquired = %d, want %d", len(held), poolSize)
+	}
+
+	for _, buf := range held[:47] {
+		big.release(buf)
+	}
+	for _, l := range smalls {
+		l.close()
+	}
+	// The remaining buffer belongs to whichever small reader won it; its lease
+	// is closed, so release it through the pool directly.
+	p.mu.Lock()
+	p.held--
+	p.free = append(p.free, held[47])
+	p.mu.Unlock()
+	big.close()
+
+	if r, h, _ := poolStats(p); r != 0 || h != 0 {
+		t.Fatalf("pool not drained: readers=%d held=%d", r, h)
 	}
 }
 
-// TestChunkPool_WindowOpensAfterFirstChunk verifies a reader is pinned to its
-// reservation until it has consumed a chunk, and takes its full share from then
-// on -- not a gradual ramp.
-func TestChunkPool_WindowOpensAfterFirstChunk(t *testing.T) {
-	p := newChunkPool(16, 16)
+// TestChunkPool_ShareFollowsRemaining verifies shares track the work left: a
+// reader's share shrinks as it is consumed and grows as its peers finish, so a
+// lone survivor ends with the whole pool.
+func TestChunkPool_ShareFollowsRemaining(t *testing.T) {
+	const poolSize = 16
+	p := newChunkPool(poolSize, 16)
 
-	l := p.register()
-	if l == nil {
-		t.Fatal("register failed")
+	a := p.register(100)
+	b := p.register(100)
+	if got := p.shareLocked(a); got != poolSize/2 {
+		t.Fatalf("equal readers: share = %d, want %d", got, poolSize/2)
 	}
 
-	// share is size/(readers+1) = 8; the window is minReaderChunks, then share.
-	for round, want := range []int{minReaderChunks, 8, 8} {
-		var held [][]byte
-		for {
-			buf := l.acquire()
-			if buf == nil {
-				break
+	// Consume most of a; its share falls and b's rises to match.
+	for range 75 {
+		a.consumed()
+	}
+	if got := p.shareLocked(a); got != 4 { // ceil(16 * 25/125)
+		t.Fatalf("after consuming 75%%: share = %d, want 4", got)
+	}
+	if got := p.shareLocked(b); got != 13 { // ceil(16 * 100/125)
+		t.Fatalf("peer share = %d, want 13", got)
+	}
+
+	// b finishes: a is alone and may take everything.
+	b.close()
+	if got := p.shareLocked(a); got != poolSize {
+		t.Fatalf("lone survivor share = %d, want %d", got, poolSize)
+	}
+	held := drain(a)
+	if len(held) != poolSize {
+		t.Fatalf("lone survivor acquired %d, want %d", len(held), poolSize)
+	}
+	for _, buf := range held {
+		a.release(buf)
+	}
+	a.close()
+
+	if r, h, _ := poolStats(p); r != 0 || h != 0 || p.remaining != 0 {
+		t.Fatalf("pool not drained: readers=%d held=%d remaining=%d", r, h, p.remaining)
+	}
+}
+
+// TestChunkPool_CloseForgetsRemaining verifies a reader closed part-way through
+// takes its unread chunks out of the denominator, so it does not keep diluting
+// its peers' shares after it is gone.
+func TestChunkPool_CloseForgetsRemaining(t *testing.T) {
+	p := newChunkPool(8, 16)
+
+	a := p.register(10)
+	b := p.register(30)
+	if got := p.shareLocked(a); got != 2 {
+		t.Fatalf("share = %d, want 2", got)
+	}
+	b.close()
+	if got := p.shareLocked(a); got != 8 {
+		t.Fatalf("share after peer closed = %d, want 8", got)
+	}
+	a.close()
+	if p.remaining != 0 || p.readers != 0 {
+		t.Fatalf("remaining=%d readers=%d after close, want 0/0", p.remaining, p.readers)
+	}
+}
+
+// TestOpenLTXFile_MultipartBigFileKeepsPoolFromSmallPeers is the end-to-end
+// form of the proportional share: a snapshot-sized file drained in lockstep with
+// several small ones holds almost the entire pool rather than an even cut, and
+// every reader still completes.
+func TestOpenLTXFile_MultipartBigFileKeepsPoolFromSmallPeers(t *testing.T) {
+	const (
+		partSize  = 512
+		poolSize  = 8
+		bigSize   = 40 * partSize
+		smallSize = 2 * partSize
+		nsmall    = 6
+	)
+
+	pool := newChunkPool(poolSize, partSize)
+	sizes := append([]int{bigSize}, make([]int, nsmall)...)
+	for i := 1; i < len(sizes); i++ {
+		sizes[i] = smallSize
+	}
+
+	servers := make([]*rangeServer, len(sizes))
+	readers := make([]io.ReadCloser, len(sizes))
+	for i, size := range sizes {
+		rs, server := newRangeServer(t, size)
+		servers[i] = rs
+
+		client := newTestReplicaClient(t, server)
+		client.DownloadPartSize = partSize
+		client.DownloadConcurrency = poolSize
+		client.pool = pool
+
+		rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, int64(size))
+		if err != nil {
+			t.Fatal(err)
+		}
+		readers[i] = rc
+	}
+
+	// Opened first, the big file took the whole pool before any peer existed.
+	if got := leaseHeld(t, readers[0]); got != poolSize {
+		t.Fatalf("big reader holds %d buffers after open, want %d", got, poolSize)
+	}
+
+	// Drain in lockstep, as the compactor does, and watch the big reader's
+	// window: its share with peers is ceil(8 * 40/52) = 7, so it yields exactly
+	// one buffer and keeps the rest until the small files are gone.
+	out := make([][]byte, len(sizes))
+	done := make([]bool, len(sizes))
+	buf := make([]byte, 100)
+	var minBigHeld = poolSize
+	for remaining := len(sizes); remaining > 0; {
+		for i := range sizes {
+			if done[i] {
+				continue
 			}
-			held = append(held, buf)
+			n, err := readers[i].Read(buf)
+			out[i] = append(out[i], buf[:n]...)
+			if err == io.EOF {
+				done[i], remaining = true, remaining-1
+			} else if err != nil {
+				t.Fatalf("reader %d: %v", i, err)
+			}
 		}
-		if len(held) != want {
-			t.Fatalf("round %d: window = %d, want %d (retired=%d)", round, len(held), want, l.retired)
+		if !done[0] && remaining > 1 {
+			if held := leaseHeld(t, readers[0]); held < minBigHeld {
+				minBigHeld = held
+			}
 		}
-		// Retire one chunk and reclaim the rest without crediting progress for
-		// them, so each round differs only by that single retirement.
-		l.release(held[0])
-		for _, buf := range held[1:] {
-			l.release(buf)
-			l.retired--
+	}
+	if minBigHeld < poolSize-1 {
+		t.Fatalf("big reader fell to %d buffers with small peers, want at least %d", minBigHeld, poolSize-1)
+	}
+
+	for i := range sizes {
+		if err := readers[i].Close(); err != nil {
+			t.Fatal(err)
 		}
+		if !bytes.Equal(out[i], servers[i].data) {
+			t.Fatalf("reader %d: data mismatch (%d bytes)", i, len(out[i]))
+		}
+	}
+	if r, held, _ := poolStats(pool); r != 0 || held != 0 {
+		t.Fatalf("pool not drained: readers=%d held=%d", r, held)
 	}
 }
 
@@ -922,16 +1096,19 @@ func TestOpenLTXFile_MultipartRetryBudget(t *testing.T) {
 				t.Fatal("read did not terminate: the retry budget is not bounded")
 			}
 
-			gets, _ := rs.stats()
-			if gets > 2*downloadPartAttempts {
-				t.Fatalf("made %d requests for a part that never progresses; the budget is not binding", gets)
+			// Every other chunk is requested once; the broken one may use its
+			// budget and, for chunk 0, the request that opened the download.
+			for idx, n := range requestsPerChunk(rs, partSize) {
+				if n > downloadPartAttempts+1 {
+					t.Fatalf("made %d requests for chunk %d, which never progresses; the budget is not binding", n, idx)
+				}
 			}
 
 			if err := rc.Close(); err != nil {
 				t.Fatal(err)
 			}
 			if r, s, _ := poolStats(pool); r != 0 || s != 0 {
-				t.Fatalf("pool not drained after failure: readers=%d surplus=%d", r, s)
+				t.Fatalf("pool not drained after failure: readers=%d held=%d", r, s)
 			}
 		})
 	}
@@ -986,12 +1163,15 @@ func TestOpenLTXFile_MultipartDribbleBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A budget that reset on progress would open one connection per byte.
-	if gets, _ := rs.stats(); gets > 4*downloadPartAttempts {
-		t.Fatalf("made %d requests for a dribbling chunk; the budget is not a lifetime count", gets)
+	// A budget that reset on progress would open one connection per byte. Every
+	// chunk dribbles here, so the bound applies to each of them.
+	for idx, n := range requestsPerChunk(rs, partSize) {
+		if n > downloadPartAttempts+1 {
+			t.Fatalf("made %d requests for dribbling chunk %d; the budget is not a lifetime count", n, idx)
+		}
 	}
 	if r, s, _ := poolStats(pool); r != 0 || s != 0 {
-		t.Fatalf("pool not drained: readers=%d surplus=%d", r, s)
+		t.Fatalf("pool not drained: readers=%d held=%d", r, s)
 	}
 }
 
