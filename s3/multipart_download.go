@@ -378,44 +378,54 @@ func (r *multipartReader) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 
+	// The lock is never held across a wait. Close needs it to mark the reader
+	// closed before it cancels the context, and that cancellation is what
+	// unblocks a wait on the network.
 	for {
-		r.mu.Lock()
-
-		// Close is terminal: no stream is reopened afterwards and every later
-		// read reports it, rather than surfacing the cancelled context as a
-		// fetch error.
-		if r.closed {
-			r.mu.Unlock()
-			return 0, os.ErrClosed
+		n, wait, err := r.advance(p)
+		if n > 0 || err != nil {
+			return n, err
 		}
-		if r.err != nil {
-			r.mu.Unlock()
-			return 0, r.err
+		if wait != nil {
+			<-wait.done
+			continue
 		}
 
-		// Nothing in hand: line up the next chunk, from its buffer if it has
-		// one and live otherwise.
-		if r.cur == nil && r.liveIdx < 0 {
+		n, err = r.readLive(p)
+		if n > 0 || err != nil {
+			return n, err
+		}
+		r.finishLive()
+	}
+}
+
+// advance serves bytes from the chunk in hand, or lines up the next one when
+// there is none. A pooled chunk still in flight is returned for the caller to
+// wait on; a chunk that never got a buffer becomes the live chunk, which the
+// caller serves itself. Returning (0, nil, nil) means the live chunk is up.
+func (r *multipartReader) advance(p []byte) (int, *downloadChunk, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Close is terminal: no stream is reopened afterwards and every later read
+	// reports it, rather than surfacing the cancelled context as a fetch error.
+	if r.closed {
+		return 0, nil, os.ErrClosed
+	}
+	if r.err != nil {
+		return 0, nil, r.err
+	}
+	if r.liveIdx >= 0 {
+		return 0, nil, nil
+	}
+
+	for {
+		if r.cur == nil {
 			if r.nextRead > r.lastIdx {
-				r.mu.Unlock()
-				return 0, io.EOF
+				return 0, nil, io.EOF
 			}
-			if ch := r.pending[r.nextRead]; ch != nil {
-				r.mu.Unlock()
-				<-ch.done
-				r.mu.Lock()
-
-				if r.closed {
-					r.mu.Unlock()
-					return 0, os.ErrClosed
-				}
-				if ch.err != nil {
-					r.err = ch.err
-					r.mu.Unlock()
-					return 0, r.err
-				}
-				r.cur, r.curOff = ch, 0
-			} else {
+			ch := r.pending[r.nextRead]
+			if ch == nil {
 				// The pool had nothing to spare when this chunk came up.
 				// Stream it rather than wait: a live chunk needs no buffer, so
 				// the reader can never be held up by its peers. Chunks are
@@ -424,24 +434,18 @@ func (r *multipartReader) Read(p []byte) (int, error) {
 				r.startLive(r.nextRead, nil)
 				r.nextFetch = r.nextRead + 1
 				r.schedule()
+				return 0, nil, nil
 			}
-		}
-
-		if r.liveIdx >= 0 {
-			r.mu.Unlock()
-			n, err := r.readLive(p)
-			if n > 0 || err != nil {
-				return n, err
+			select {
+			case <-ch.done:
+			default:
+				return 0, ch, nil
 			}
-
-			// The live chunk is fully delivered; hand over to the next one.
-			r.mu.Lock()
-			r.liveIdx = -1
-			r.nextRead++
-			r.lease.consumed()
-			r.schedule()
-			r.mu.Unlock()
-			continue
+			if ch.err != nil {
+				r.err = ch.err
+				return 0, nil, r.err
+			}
+			r.cur, r.curOff = ch, 0
 		}
 
 		if r.curOff < r.cur.n {
@@ -450,12 +454,21 @@ func (r *multipartReader) Read(p []byte) (int, error) {
 			if r.curOff >= r.cur.n {
 				r.retire()
 			}
-			r.mu.Unlock()
-			return n, nil
+			return n, nil, nil
 		}
 		r.retire()
-		r.mu.Unlock()
 	}
+}
+
+// finishLive hands over from a fully delivered live chunk to the next one.
+func (r *multipartReader) finishLive() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.liveIdx = -1
+	r.nextRead++
+	r.lease.consumed()
+	r.schedule()
 }
 
 // retire returns the current chunk's buffer to the pool and refills the window.
