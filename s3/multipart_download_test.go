@@ -191,6 +191,16 @@ func requestsPerChunk(rs *rangeServer, partSize int64) map[int64]int {
 	return per
 }
 
+// maxRequestsForChunk is the most connections a chunk may open before its
+// budget binds. Only chunk 0 gets one more: the request that opened the
+// download is made before readLive and is not counted against its reopens.
+func maxRequestsForChunk(idx int64) int {
+	if idx == 0 {
+		return downloadPartAttempts + 1
+	}
+	return downloadPartAttempts
+}
+
 // readWithChunks reads rc in randomly sized pieces to exercise partial reads
 // across chunk boundaries.
 func readWithChunks(t *testing.T, rc io.Reader, max int) []byte {
@@ -1096,10 +1106,10 @@ func TestOpenLTXFile_MultipartRetryBudget(t *testing.T) {
 				t.Fatal("read did not terminate: the retry budget is not bounded")
 			}
 
-			// Every other chunk is requested once; the broken one may use its
-			// budget and, for chunk 0, the request that opened the download.
+			// Every other chunk is requested once; the broken one may use
+			// exactly its budget.
 			for idx, n := range requestsPerChunk(rs, partSize) {
-				if n > downloadPartAttempts+1 {
+				if n > maxRequestsForChunk(idx) {
 					t.Fatalf("made %d requests for chunk %d, which never progresses; the budget is not binding", n, idx)
 				}
 			}
@@ -1166,7 +1176,7 @@ func TestOpenLTXFile_MultipartDribbleBudget(t *testing.T) {
 	// A budget that reset on progress would open one connection per byte. Every
 	// chunk dribbles here, so the bound applies to each of them.
 	for idx, n := range requestsPerChunk(rs, partSize) {
-		if n > downloadPartAttempts+1 {
+		if n > maxRequestsForChunk(idx) {
 			t.Fatalf("made %d requests for dribbling chunk %d; the budget is not a lifetime count", n, idx)
 		}
 	}
