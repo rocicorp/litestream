@@ -728,16 +728,16 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 // the object when size is zero.
 //
 // A parallel download needs a known length to plan from and only pays off past
-// one part, so anything else -- multipart disabled, no size, a size that fits in
-// one part, or a pool with no room -- is a single ranged GET, exactly as before.
+// one part, so anything else -- multipart disabled, no size, or a size that fits
+// in one part -- is a single ranged GET, exactly as before.
 func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size int64) (io.ReadCloser, error) {
 	pool := c.downloadPool()
 
-	// Register before fetching anything. A saturated pool refuses rather than
-	// waits, so a reader can never be blocked by its peers; see minReaderChunks.
+	// Register before fetching anything, so the pool weighs this file against
+	// the readers already open from the moment its first chunk is requested.
 	var lease *chunkLease
 	if pool != nil && size > pool.partSize {
-		lease = pool.register()
+		lease = pool.register((size + pool.partSize - 1) / pool.partSize)
 	}
 	if lease == nil {
 		out, err := c.getObject(ctx, key, offset, size)
@@ -770,9 +770,9 @@ func (c *ReplicaClient) openRange(ctx context.Context, key string, offset, size 
 }
 
 // downloadPool returns the chunk pool for this client, or nil if multipart
-// downloads are disabled. A pool that cannot seat one reader is no pool at all.
+// downloads are disabled. A pool of one buffer is not a parallel download.
 func (c *ReplicaClient) downloadPool() *chunkPool {
-	if c.DownloadConcurrency < minReaderChunks || c.DownloadPartSize <= 0 {
+	if c.DownloadConcurrency < minDownloadConcurrency || c.DownloadPartSize <= 0 {
 		return nil
 	}
 	if c.pool != nil {
