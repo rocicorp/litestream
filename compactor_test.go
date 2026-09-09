@@ -910,8 +910,11 @@ func TestCompactor_CompactPassesFileSize(t *testing.T) {
 	client := &recordingCompactionClient{ReplicaClient: file.NewReplicaClient(t.TempDir())}
 	compactor := litestream.NewCompactor(client, slog.Default())
 
-	createTestLTXFile(t, client, 0, 1, 1)
+	// Base is captured in the snapshot at TXID 1, so it's never re-read as a
+	// compaction source; only the L0 increments from TXID 2 onward are.
+	createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
 	createTestLTXFile(t, client, 0, 2, 2)
+	createTestLTXFile(t, client, 0, 3, 3)
 
 	// Record the true sizes before compacting.
 	want := make(map[ltx.TXID]int64)
