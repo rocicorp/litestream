@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +46,59 @@ var (
 	ErrDatabaseNotFound = errors.New("database not found")
 	ErrDatabaseNotOpen  = errors.New("database not open")
 )
+
+// CompactionSerializeMode controls how per-database compaction/snapshot
+// serialization is applied in Store.CompactDB. It exists so the behavior can
+// be compared at runtime (see the LITESTREAM_COMPACTION_SERIALIZE env var).
+type CompactionSerializeMode int
+
+const (
+	// SerializeAll serializes every level (L1..L9) against each other per DB.
+	// This is the historical behavior: at most one compaction or snapshot runs
+	// for a given database at a time. Safest for memory, but a long-running
+	// snapshot (L9) blocks lower-level compactions for its whole duration.
+	SerializeAll CompactionSerializeMode = iota
+
+	// SerializeHeavy serializes only the snapshot level (L9), which is the only
+	// O(db-size) operation once lower levels seek past the newest snapshot.
+	// Incremental compactions (L1..) run freely, so they are not starved while a
+	// snapshot is in flight, while the whole-DB page-index memory footprint is
+	// still capped at one snapshot at a time.
+	SerializeHeavy
+
+	// SerializeOff disables per-DB compaction serialization entirely.
+	SerializeOff
+)
+
+// ParseCompactionSerializeMode parses a mode from its string form
+// ("all", "heavy", "off"). An empty string returns SerializeAll (the default).
+// Unrecognized values return an error.
+func ParseCompactionSerializeMode(s string) (CompactionSerializeMode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "all":
+		return SerializeAll, nil
+	case "heavy":
+		return SerializeHeavy, nil
+	case "off", "none", "false":
+		return SerializeOff, nil
+	default:
+		return SerializeAll, fmt.Errorf("invalid compaction serialize mode %q (want all, heavy, or off)", s)
+	}
+}
+
+// String returns the canonical string form of the mode.
+func (m CompactionSerializeMode) String() string {
+	switch m {
+	case SerializeAll:
+		return "all"
+	case SerializeHeavy:
+		return "heavy"
+	case SerializeOff:
+		return "off"
+	default:
+		return fmt.Sprintf("CompactionSerializeMode(%d)", int(m))
+	}
+}
 
 // DBNotReadyError is returned when an operation is attempted before the
 // database has been initialized (e.g., page size not yet known).
@@ -116,6 +170,10 @@ type Store struct {
 	// If true, compaction is run in the background according to compaction levels.
 	CompactionMonitorEnabled bool
 
+	// CompactionSerialize controls per-DB serialization of compactions/snapshots
+	// in CompactDB. Defaults to SerializeAll.
+	CompactionSerialize CompactionSerializeMode
+
 	// If true, verify TXID consistency at destination level after each compaction.
 	VerifyCompaction bool
 
@@ -154,6 +212,7 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		L0Retention:              DefaultL0Retention,
 		L0RetentionCheckInterval: DefaultL0RetentionCheckInterval,
 		CompactionMonitorEnabled: true,
+		CompactionSerialize:      SerializeAll,
 		RetentionEnabled:         true,
 		ShutdownSyncTimeout:      DefaultShutdownSyncTimeout,
 		ShutdownSyncInterval:     DefaultShutdownSyncInterval,
@@ -778,6 +837,8 @@ func (s *Store) allDatabasesHealthy(since time.Time) bool {
 // CompactDB performs a compaction or snapshot for a given database on a single destination level.
 // This function will only proceed if a compaction has not occurred before the last compaction time.
 func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*ltx.FileInfo, error) {
+	dstLevel := lvl.Level
+
 	// Serialize compaction/snapshot per database. The snapshot level and each
 	// compaction level run in independent goroutines (see Store.Open), so
 	// without this guard a snapshot (L9) and a lower-level compaction can run
@@ -785,17 +846,25 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 	// index, and on a large database the overlap can exhaust the memory limit
 	// and trigger an OOM kill. If another compaction is already running for this
 	// DB, skip this tick; the monitor retries on its next interval.
-	if !db.compactionMu.TryLock() {
-		return nil, ErrCompactionInProgress
+	//
+	// The set of operations that participate is controlled by CompactionSerialize:
+	//   - SerializeAll: every level takes the lock (historical behavior).
+	//   - SerializeHeavy: only the snapshot level (L9, the sole O(db-size)
+	//     operation) takes the lock, so incremental compactions are not starved.
+	//   - SerializeOff: no level takes the lock.
+	serialize := s.CompactionSerialize == SerializeAll ||
+		(s.CompactionSerialize == SerializeHeavy && dstLevel == SnapshotLevel)
+	if serialize {
+		if !db.compactionMu.TryLock() {
+			return nil, ErrCompactionInProgress
+		}
+		defer db.compactionMu.Unlock()
 	}
-	defer db.compactionMu.Unlock()
 
 	// Skip if database is not yet initialized (page size unknown).
 	if db.PageSize() == 0 {
 		return nil, &DBNotReadyError{Reason: "page size not initialized"}
 	}
-
-	dstLevel := lvl.Level
 
 	// Ensure we are not re-compacting before the most recent compaction time.
 	prevCompactionAt := lvl.PrevCompactionAt(time.Now())
