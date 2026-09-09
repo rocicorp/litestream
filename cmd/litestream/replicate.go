@@ -235,6 +235,17 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	levels := c.Config.CompactionLevels()
 	c.Store = litestream.NewStore(dbs, levels)
 
+	// Per-DB compaction/snapshot serialization mode. Overridable at runtime for
+	// A/B comparison via LITESTREAM_COMPACTION_SERIALIZE=all|heavy|off (default all).
+	if v := os.Getenv("LITESTREAM_COMPACTION_SERIALIZE"); v != "" {
+		mode, err := litestream.ParseCompactionSerializeMode(v)
+		if err != nil {
+			return fmt.Errorf("LITESTREAM_COMPACTION_SERIALIZE: %w", err)
+		}
+		c.Store.CompactionSerialize = mode
+		slog.Info("compaction serialization mode set", "mode", mode.String())
+	}
+
 	// Only override default snapshot interval if explicitly set in config
 	if c.Config.Snapshot.Interval != nil {
 		c.Store.SnapshotInterval = *c.Config.Snapshot.Interval
