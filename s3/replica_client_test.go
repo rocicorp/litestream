@@ -2919,7 +2919,7 @@ func TestNewReplicaClientFromURL_EndpointEnvVar(t *testing.T) {
 // 5 requested") and Litestream stopped retrying exactly when retries mattered.
 // The bucket only refills on success, so 100+ consecutive failures starve it.
 func TestTransportRetryer_SurvivesSustainedFailures(t *testing.T) {
-	retryer := newTransportRetryer()
+	retryer := newTransportRetryer(slog.Default())
 
 	if got := retryer.MaxAttempts(); got != transportRetryMaxAttempts {
 		t.Fatalf("MaxAttempts() = %d, want %d", got, transportRetryMaxAttempts)
@@ -2972,7 +2972,7 @@ func TestReplicaClient_RetryerSurvivesSustainedFailures(t *testing.T) {
 // (observed from Tigris during soak testing). The SDK defaults treat neither
 // as retryable, so restores failed after effectively zero patience.
 func TestTransportRetryer_RetriesProviderThrottleResponses(t *testing.T) {
-	retryer := newTransportRetryer()
+	retryer := newTransportRetryer(slog.Default())
 
 	status408 := &smithyhttp.ResponseError{Response: &smithyhttp.Response{Response: &http.Response{StatusCode: http.StatusRequestTimeout}}, Err: fmt.Errorf("request timeout")}
 	if !retryer.IsErrorRetryable(status408) {

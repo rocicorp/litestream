@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -206,11 +207,12 @@ func sharedChunkPool(size int, partSize int64) *chunkPool {
 
 // downloadChunk is a single ranged GET in flight or waiting to be consumed.
 type downloadChunk struct {
-	idx  int64
-	buf  []byte
-	n    int
-	err  error
-	done chan struct{}
+	idx    int64
+	buf    []byte
+	n      int
+	err    error
+	done   chan struct{}
+	doneAt time.Time // when the fetch finished; for consumer-lag accounting
 }
 
 // multipartReader reassembles an object from parallel ranged GETs.
@@ -247,6 +249,19 @@ type multipartReader struct {
 	livePos int64 // bytes of the live chunk delivered so far
 	reopens int   // connections opened for the live chunk; see downloadPartAttempts
 
+	// Diagnostics, reported at debug level. partRetries is written by fetch
+	// goroutines; the rest only by the reading goroutine. netWait is time the
+	// consumer spent blocked on a part still in flight; consumerLag is how
+	// long finished parts sat before the consumer took them. Large lag with
+	// little wait means the consumer, not the network, is the bottleneck.
+	started     time.Time
+	bytesOut    int64
+	partRetries atomic.Int64
+	netWait     time.Duration
+	netWaits    int64
+	consumerLag time.Duration
+	maxLag      time.Duration
+
 	mu        sync.Mutex
 	pending   map[int64]*downloadChunk
 	nextFetch int64 // next chunk to request from the pool
@@ -273,6 +288,7 @@ func newMultipartReader(ctx context.Context, c *ReplicaClient, key string, live 
 		liveIdx:   -1,
 		pending:   make(map[int64]*downloadChunk),
 		nextFetch: 1,
+		started:   time.Now(),
 	}
 	r.startLive(0, live)
 
@@ -323,6 +339,7 @@ func (r *multipartReader) schedule() {
 func (r *multipartReader) fetch(ch *downloadChunk) {
 	defer r.wg.Done()
 	defer close(ch.done)
+	defer func() { ch.doneAt = time.Now() }()
 
 	start := r.base + ch.idx*r.partSize
 	length := r.chunkLen(ch.idx)
@@ -349,6 +366,9 @@ func (r *multipartReader) fetch(ch *downloadChunk) {
 			ch.err = fmt.Errorf("s3: download part %d of %s at offset %d: %w", ch.idx, r.key, start+off, err)
 			return
 		}
+		r.partRetries.Add(1)
+		r.c.logger.Debug("download part failed, retrying",
+			"part", ch.idx, "offset", start+off, "received", off, "attempt", attempt+1, "error", err)
 	}
 }
 
@@ -383,15 +403,20 @@ func (r *multipartReader) Read(p []byte) (int, error) {
 	// unblocks a wait on the network.
 	for {
 		n, wait, err := r.advance(p)
+		r.bytesOut += int64(n)
 		if n > 0 || err != nil {
 			return n, err
 		}
 		if wait != nil {
+			t := time.Now()
 			<-wait.done
+			r.netWait += time.Since(t)
+			r.netWaits++
 			continue
 		}
 
 		n, err = r.readLive(p)
+		r.bytesOut += int64(n)
 		if n > 0 || err != nil {
 			return n, err
 		}
@@ -469,17 +494,60 @@ func (r *multipartReader) finishLive() {
 	r.nextRead++
 	r.lease.consumed()
 	r.schedule()
+	r.progressLocked()
 }
 
 // retire returns the current chunk's buffer to the pool and refills the window.
 // r.mu must be held.
 func (r *multipartReader) retire() {
+	if lag := time.Since(r.cur.doneAt); lag > 0 {
+		r.consumerLag += lag
+		if lag > r.maxLag {
+			r.maxLag = lag
+		}
+	}
 	delete(r.pending, r.cur.idx)
 	r.lease.release(r.cur.buf)
 	r.lease.consumed()
 	r.cur, r.curOff = nil, 0
 	r.nextRead++
 	r.schedule()
+	r.progressLocked()
+}
+
+// progressInterval is how many delivered parts separate progress log lines.
+const progressInterval = 64
+
+// progressLocked logs a progress line every progressInterval delivered parts.
+// r.mu must be held.
+func (r *multipartReader) progressLocked() {
+	if r.nextRead%progressInterval != 0 {
+		return
+	}
+	elapsed := time.Since(r.started)
+	r.c.logger.Debug("download progress",
+		"parts", r.nextRead, "of", r.lastIdx+1, "bytes", r.bytesOut, "total", r.total,
+		"elapsed", elapsed.Round(time.Second), "mbps", mbps(r.bytesOut, elapsed),
+		"window", r.lease.held, "in-flight", len(r.pending), "part-retries", r.partRetries.Load(),
+		"net-wait", r.netWait.Round(time.Millisecond), "net-waits", r.netWaits,
+		"consumer-lag-avg", r.avgLag().Round(time.Millisecond), "consumer-lag-max", r.maxLag.Round(time.Millisecond))
+}
+
+// avgLag is the mean time a downloaded part sat in its buffer before the
+// consumer took it.
+func (r *multipartReader) avgLag() time.Duration {
+	if r.nextRead <= 1 {
+		return 0
+	}
+	return r.consumerLag / time.Duration(r.nextRead-1)
+}
+
+// mbps formats a throughput in mebibytes per second.
+func mbps(n int64, d time.Duration) float64 {
+	if d <= 0 {
+		return 0
+	}
+	return float64(n) / d.Seconds() / (1024 * 1024)
 }
 
 // liveOffset is the absolute object offset of the next live byte.
@@ -576,6 +644,15 @@ func (r *multipartReader) Close() error {
 	r.cancel()
 	r.wg.Wait()
 	r.closeLive()
+
+	elapsed := time.Since(r.started)
+	r.c.logger.Debug("multipart download closed",
+		"key", r.key, "bytes", r.bytesOut, "total", r.total, "parts", r.lastIdx+1,
+		"elapsed", elapsed.Round(time.Millisecond), "mbps", mbps(r.bytesOut, elapsed),
+		"part-retries", r.partRetries.Load(),
+		"net-wait", r.netWait.Round(time.Millisecond), "net-waits", r.netWaits,
+		"consumer-lag-avg", r.avgLag().Round(time.Millisecond), "consumer-lag-max", r.maxLag.Round(time.Millisecond),
+		"err", r.err)
 
 	r.mu.Lock()
 	if r.cur != nil {
