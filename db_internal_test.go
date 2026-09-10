@@ -4808,14 +4808,17 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 
 // TestDB_SnapshotReaderDuringClose verifies that a snapshot whose position was
 // captured just before Close neither races on the database file handle nor
-// panics when it goes on to read pages: it completes, or it fails cleanly once
-// the handle is closed.
+// panics when it goes on to read pages: it completes, or it fails cleanly
+// because the handle is closed.
 //
 // Regression test for a data race between Close replacing db.f and
 // snapshotReader reading it after the executor semaphore had been released.
-// The two halves of SnapshotReader are called directly so Close can be placed
-// in that gap. The goroutines deliberately share no synchronization, so the
-// race detector flags an unordered read of db.f whichever side wins.
+// The position is captured synchronously so every iteration reaches the
+// second half; that half runs in a goroutine started before Close, so nothing
+// orders its read of the handle after Close's write and the race detector
+// flags the old code. Merely running SnapshotReader and Close concurrently
+// does not: both take the file descriptor's internal mutex, which the
+// detector treats as synchronization.
 func TestDB_SnapshotReaderDuringClose(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping in short mode")
@@ -4857,27 +4860,35 @@ func TestDB_SnapshotReaderDuringClose(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			// First half: the executor semaphore is held and released here,
+			// before Close can take it.
+			pos, err := db.snapshotPosition(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Second half, delayed so Close usually completes first. Either
+			// order must be race-free; the delay only makes the closed-handle
+			// path the common one.
 			var wg sync.WaitGroup
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				pos, err := db.snapshotPosition(ctx)
-				if err != nil {
-					return // Close won the semaphore: a clean refusal is fine.
-				}
-				// The semaphore is released; give Close time to run before
-				// the snapshot touches the file handle.
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
 				r, err := db.snapshotReader(ctx, pos)
 				if err != nil {
 					pos.close()
-					return // Handle already closed: also fine.
+					if !errors.Is(err, os.ErrClosed) {
+						t.Errorf("snapshot after close: %v, want %v", err, os.ErrClosed)
+					}
+					return
 				}
-				_, _ = io.Copy(io.Discard, r)
+				if _, err := io.Copy(io.Discard, r); err != nil && !errors.Is(err, os.ErrClosed) {
+					t.Errorf("read snapshot: %v", err)
+				}
 				_ = r.Close()
 			}()
 
-			time.Sleep(10 * time.Millisecond)
 			if err := db.Close(ctx); err != nil {
 				t.Fatal(err)
 			}
