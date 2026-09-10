@@ -1,6 +1,7 @@
 package litestream
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -735,14 +736,23 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
 
+	// Every stream boundary below is buffered. The LTX decoder issues several
+	// small reads per page (page header, size prefix, compressed block) and
+	// the compactor several small writes; unbuffered, each read is a syscall
+	// or a mutex round trip into the storage reader and each write into the
+	// pipe is a synchronous goroutine handoff. On a multi-GB snapshot that
+	// per-page overhead, not decompression or the network, bounds the restore.
+	const restoreBufSize = 1 << 20
+
 	rdrs := make([]io.Reader, 0, len(infos))
-	defer func() {
-		for _, rd := range rdrs {
-			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
-			}
+	closers := make([]io.Closer, 0, len(infos))
+	closeReaders := func() {
+		for _, c := range closers {
+			_ = c.Close()
 		}
-	}()
+		closers = nil
+	}
+	defer closeReaders()
 
 	for _, info := range infos {
 		// Validate file size - must be at least header size to be readable
@@ -753,7 +763,9 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
-		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger()))
+		rr := internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger())
+		closers = append(closers, rr)
+		rdrs = append(rdrs, bufio.NewReaderSize(rr, restoreBufSize))
 	}
 
 	if len(rdrs) == 0 {
@@ -780,21 +792,41 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	pr, pw := io.Pipe()
-
-	go func() {
-		c, err := ltx.NewCompactor(pw, rdrs)
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
-			return
+	fw := bufio.NewWriterSize(f, restoreBufSize)
+	if len(rdrs) == 1 {
+		// A one-file plan is a bare snapshot, so decode it straight to the
+		// database. Routing it through the compactor would decompress,
+		// recompress and re-hash every page only to decompress it again on
+		// the other side of a pipe, roughly doubling the CPU per page. The
+		// decoder still verifies the file and post-apply checksums on close.
+		if err := ltx.NewDecoder(rdrs[0]).DecodeDatabaseTo(fw); err != nil {
+			return fmt.Errorf("decode database: %w", err)
 		}
-		c.HeaderFlags = ltx.HeaderFlagNoChecksum
-		_ = pw.CloseWithError(c.Compact(ctx))
-	}()
+	} else {
+		pr, pw := io.Pipe()
 
-	dec := ltx.NewDecoder(pr)
-	if err := dec.DecodeDatabaseTo(f); err != nil {
-		return fmt.Errorf("decode database: %w", err)
+		go func() {
+			bw := bufio.NewWriterSize(pw, restoreBufSize)
+			c, err := ltx.NewCompactor(bw, rdrs)
+			if err != nil {
+				pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+				return
+			}
+			c.HeaderFlags = ltx.HeaderFlagNoChecksum
+			if err := c.Compact(ctx); err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
+			_ = pw.CloseWithError(bw.Flush())
+		}()
+
+		dec := ltx.NewDecoder(bufio.NewReaderSize(pr, restoreBufSize))
+		if err := dec.DecodeDatabaseTo(fw); err != nil {
+			return fmt.Errorf("decode database: %w", err)
+		}
+	}
+	if err := fw.Flush(); err != nil {
+		return fmt.Errorf("flush database: %w", err)
 	}
 
 	if err := f.Sync(); err != nil {
@@ -826,11 +858,10 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Enter follow mode if enabled, continuously applying new LTX files.
 	if opt.Follow {
-		for _, rd := range rdrs {
-			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
-			}
-		}
+		// follow runs until the context is cancelled, so release the
+		// snapshot's streams and pool buffers now rather than holding them
+		// for the whole session; the deferred call is then a no-op.
+		closeReaders()
 		rdrs = nil
 
 		maxTXID := infos[len(infos)-1].MaxTXID
