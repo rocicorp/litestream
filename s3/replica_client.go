@@ -450,7 +450,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Build configuration options
 	configOpts := []func(*config.LoadOptions) error{
 		config.WithRegion(region),
-		config.WithRetryer(newTransportRetryer),
+		config.WithRetryer(func() aws.Retryer { return newTransportRetryer(c.logger) }),
 	}
 
 	// Add HTTP client with proper timeout
@@ -629,7 +629,7 @@ const transportRetryMaxAttempts = 10
 // successful responses, so a sustained provider flap drains it to zero and
 // every subsequent operation fails fast ("retry quota exceeded, 0 available")
 // precisely when retrying matters most for a replication tool.
-func newTransportRetryer() aws.Retryer {
+func newTransportRetryer(logger *slog.Logger) aws.Retryer {
 	return retry.NewStandard(func(o *retry.StandardOptions) {
 		o.MaxAttempts = transportRetryMaxAttempts
 		o.RateLimiter = ratelimit.None
@@ -638,6 +638,9 @@ func newTransportRetryer() aws.Retryer {
 		// classifies as retryable by default. Genuine client-side context
 		// cancellation stays non-retryable via the standard retryer's
 		// canceled-context check, which runs before these.
+		// The logger goes first: the SDK stops at the first classifier with an
+		// opinion, so appended it would only ever see unclassified errors.
+		o.Retryables = append([]retry.IsErrorRetryable{retryErrorLogger{logger: logger}}, o.Retryables...)
 		o.Retryables = append(o.Retryables,
 			retry.RetryableHTTPStatusCode{Codes: map[int]struct{}{
 				http.StatusRequestTimeout: {},
@@ -649,11 +652,24 @@ func newTransportRetryer() aws.Retryer {
 	})
 }
 
+// retryErrorLogger is a diagnostic IsErrorRetryable that logs every error the
+// SDK evaluates for retry and defers the decision to the remaining retryables.
+// The SDK's LogRetries mode records only "retrying request ... attempt N", not
+// why, so this is the only place the underlying failure is visible.
+type retryErrorLogger struct {
+	logger *slog.Logger
+}
+
+func (l retryErrorLogger) IsErrorRetryable(err error) aws.Ternary {
+	l.logger.Debug("s3 sdk request error", "error", err)
+	return aws.UnknownTernary
+}
+
 // findBucketRegion looks up the AWS region for a bucket. Returns blank if non-S3.
 func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
 	// Build a config with credentials but no region
 	configOpts := []func(*config.LoadOptions) error{
-		config.WithRetryer(newTransportRetryer),
+		config.WithRetryer(func() aws.Retryer { return newTransportRetryer(c.logger) }),
 	}
 
 	// Add static credentials if provided
