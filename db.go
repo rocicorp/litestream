@@ -2325,7 +2325,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 				s.snapshotting = true
 				s.reason = info.reason
 			})
-		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+		if err := db.writeLTXFromDB(ctx, enc, db.f, walFile, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
 				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 			}
@@ -2465,7 +2465,11 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	return result, nil
 }
 
-func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
+// writeLTXFromDB encodes every page of the database into enc, taking pages
+// present in pageMap from walFile and the rest from dbFile. dbFile is passed
+// explicitly rather than read from db.f because the snapshot path runs
+// without execSem, where db.f may be replaced by Close.
+func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, dbFile, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
 	lockPgno := ltx.LockPgno(uint32(db.pageSize))
 	data := make([]byte, db.pageSize)
 
@@ -2501,7 +2505,7 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.
 		db.Logger.Log(ctx, internal.LevelTrace, "encode page from database", "offset", offset, "pgno", pgno)
 
 		// Otherwise read directly from the database file.
-		if _, err := db.f.ReadAt(data, offset); err != nil {
+		if _, err := dbFile.ReadAt(data, offset); err != nil {
 			return fmt.Errorf("read database page %d: %w", pgno, err)
 		}
 		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
@@ -2864,6 +2868,7 @@ type snapshotReadPosition struct {
 	pageSize     int
 	walEndOffset int64
 	db           *DB
+	f            *os.File // database file handle captured under execSem; see snapshotPosition
 	closeOnce    sync.Once
 }
 
@@ -2924,6 +2929,18 @@ func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, erro
 		walEndOffset = WALHeaderSize
 	}
 
+	// Capture the database file handle here, under execSem, rather than
+	// reading db.f later from the snapshot goroutine. Close replaces db.f
+	// while holding execSem, so a read outside it races with shutdown: the
+	// snapshot could observe a nil handle or a torn pointer. Once captured,
+	// the *os.File is safe to use concurrently with Close; reads after the
+	// handle is closed fail with os.ErrClosed and the snapshot aborts
+	// cleanly rather than racing.
+	f := db.f
+	if f == nil {
+		return nil, &DBNotReadyError{Reason: "database closed"}
+	}
+
 	// Acquire the checkpoint read lock while the executor semaphore is still
 	// held (the deferred release runs after this function returns). Every
 	// checkpoint takes chkMu under execSem, so this handoff guarantees no
@@ -2935,6 +2952,7 @@ func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, erro
 		pageSize:     pageSize,
 		walEndOffset: walEndOffset,
 		db:           db,
+		f:            f,
 	}, nil
 }
 
@@ -2986,7 +3004,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 
 	// TODO(ltx): Read database size from database header.
 
-	fi, err := db.f.Stat()
+	fi, err := pos.f.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -3063,7 +3081,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			return
 		}
 
-		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+		if err := db.writeLTXFromDB(ctx, enc, pos.f, walFile, commit, pageMap); err != nil {
 			pw.CloseWithError(fmt.Errorf("write snapshot ltx: %w", err))
 			return
 		}

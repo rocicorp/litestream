@@ -4805,3 +4805,83 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 	default:
 	}
 }
+
+// TestDB_SnapshotReaderDuringClose verifies that a snapshot whose position was
+// captured just before Close neither races on the database file handle nor
+// panics when it goes on to read pages: it completes, or it fails cleanly once
+// the handle is closed.
+//
+// Regression test for a data race between Close replacing db.f and
+// snapshotReader reading it after the executor semaphore had been released.
+// The two halves of SnapshotReader are called directly so Close can be placed
+// in that gap. The goroutines deliberately share no synchronization, so the
+// race detector flags an unordered read of db.f whichever side wins.
+func TestDB_SnapshotReaderDuringClose(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	for i := range 4 {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "db")
+
+			db := NewDB(dbPath)
+			db.MonitorInterval = 0
+			db.CheckpointInterval = 0
+			db.MinCheckpointPageN = 1000000
+			db.Replica = NewReplica(db)
+			db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+			db.Replica.MonitorEnabled = false
+			db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+			if err := db.Open(); err != nil {
+				t.Fatal(err)
+			}
+
+			sqldb, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sqldb.Close()
+			for _, q := range []string{
+				`PRAGMA journal_mode = wal`,
+				`CREATE TABLE kv (id INTEGER PRIMARY KEY, v BLOB)`,
+				`INSERT INTO kv VALUES (1, randomblob(65536))`,
+			} {
+				if _, err := sqldb.Exec(q); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			ctx := t.Context()
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				pos, err := db.snapshotPosition(ctx)
+				if err != nil {
+					return // Close won the semaphore: a clean refusal is fine.
+				}
+				// The semaphore is released; give Close time to run before
+				// the snapshot touches the file handle.
+				time.Sleep(50 * time.Millisecond)
+				r, err := db.snapshotReader(ctx, pos)
+				if err != nil {
+					pos.close()
+					return // Handle already closed: also fine.
+				}
+				_, _ = io.Copy(io.Discard, r)
+				_ = r.Close()
+			}()
+
+			time.Sleep(10 * time.Millisecond)
+			if err := db.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			wg.Wait()
+		})
+	}
+}
