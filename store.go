@@ -325,6 +325,13 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
+	// Stop the background monitors (snapshot, compaction, retention,
+	// validation) before closing the databases they operate on. Closing
+	// first left a monitor free to start a snapshot or compaction against a
+	// database whose handles were being torn down underneath it.
+	s.cancel()
+	s.wg.Wait()
+
 	s.mu.Lock()
 	dbs := slices.Clone(s.dbs)
 	s.mu.Unlock()
@@ -340,10 +347,6 @@ func (s *Store) Close(ctx context.Context) (err error) {
 			}
 		}
 	}
-
-	// Cancel and wait for background tasks to complete.
-	s.cancel()
-	s.wg.Wait()
 
 	return err
 }
