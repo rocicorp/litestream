@@ -40,6 +40,17 @@ type rangeServer struct {
 	// would otherwise retry an aborted connection ten times with backoff.
 	emptyBody map[int64]bool
 
+	// pace, when set, returns a per-KiB delay for a request at the given
+	// start offset. A non-zero delay makes that connection a straggler: the
+	// body is written in 1 KiB slices with the delay between them.
+	pace func(start int64) time.Duration
+
+	// hangOnce makes the first request at a given start offset send its
+	// headers and then deliver nothing until hangRelease is closed,
+	// simulating a connection that is open but stalled.
+	hangOnce    map[int64]bool
+	hangRelease chan struct{}
+
 	mu     sync.Mutex
 	ranges []int64 // start offset of every request, in arrival order
 	gets   int
@@ -57,9 +68,13 @@ func newRangeServer(t *testing.T, size int) (*rangeServer, *httptest.Server) {
 		data:         data,
 		truncateOnce: make(map[int64]bool),
 		emptyBody:    make(map[int64]bool),
+		hangOnce:     make(map[int64]bool),
+		hangRelease:  make(chan struct{}),
 	}
 	server := httptest.NewServer(http.HandlerFunc(rs.serve))
 	t.Cleanup(server.Close)
+	// Runs before server.Close, which waits for in-flight handlers.
+	t.Cleanup(func() { close(rs.hangRelease) })
 	return rs, server
 }
 
@@ -89,6 +104,10 @@ func (rs *rangeServer) serve(w http.ResponseWriter, r *http.Request) {
 		rs.truncateOnce[start] = false
 	}
 	empty := rs.emptyBody[start]
+	hang := rs.hangOnce[start]
+	if hang {
+		rs.hangOnce[start] = false
+	}
 	rs.mu.Unlock()
 
 	if rs.delay != nil {
@@ -113,6 +132,23 @@ func (rs *rangeServer) serve(w http.ResponseWriter, r *http.Request) {
 		// part end prematurely.
 		_, _ = w.Write(body[:len(body)/2])
 		panic(http.ErrAbortHandler)
+	}
+	if hang {
+		w.(http.Flusher).Flush()
+		<-rs.hangRelease
+		return
+	}
+	if rs.pace != nil {
+		if d := rs.pace(start); d > 0 {
+			for off := 0; off < len(body); off += 1024 {
+				if _, err := w.Write(body[off:min(off+1024, len(body))]); err != nil {
+					return
+				}
+				w.(http.Flusher).Flush()
+				time.Sleep(d)
+			}
+			return
+		}
 	}
 	_, _ = w.Write(body)
 }
@@ -1209,5 +1245,138 @@ func TestOpenLTXFile_MultipartCloseIsTerminal(t *testing.T) {
 	}
 	if err := rc.Close(); err != nil {
 		t.Fatalf("second close = %v, want nil", err)
+	}
+}
+
+// hedgeTestSettings makes straggler handling fire on test time scales and
+// restores the defaults afterwards.
+func hedgeTestSettings(t *testing.T, minPiece, readStep int64, stall time.Duration) {
+	t.Helper()
+	oldInterval, oldAge, oldMin, oldStep, oldStall := hedgeCheckInterval, hedgeMinAge, hedgeMinPiece, pieceReadStep, stallTimeout
+	hedgeCheckInterval, hedgeMinAge, hedgeMinPiece, pieceReadStep, stallTimeout = 5*time.Millisecond, 0, minPiece, readStep, stall
+	t.Cleanup(func() {
+		hedgeCheckInterval, hedgeMinAge, hedgeMinPiece, pieceReadStep, stallTimeout = oldInterval, oldAge, oldMin, oldStep, oldStall
+	})
+}
+
+// TestOpenLTXFile_MultipartStragglerSplit verifies that a part whose
+// connection is far slower than its peers has its remaining range split onto
+// fresh connections once idle capacity has built up behind it, instead of
+// stalling the consumer for the straggler's full duration.
+func TestOpenLTXFile_MultipartStragglerSplit(t *testing.T) {
+	const (
+		partSize = 256 << 10
+		size     = 16 * partSize
+		poolSize = 8
+		straggle = 2 * partSize // start offset of the slow part
+	)
+	hedgeTestSettings(t, 16<<10, 16<<10, time.Hour)
+
+	rs, server := newRangeServer(t, size)
+	// Unsplit, the straggler takes 256 KiB / 1 KiB * 20ms = ~5s. Every
+	// request that starts inside the part (a split) runs at full speed.
+	rs.pace = func(start int64) time.Duration {
+		if start == straggle {
+			return 20 * time.Millisecond
+		}
+		return 0
+	}
+
+	client, pool := newMultipartTestClient(t, server, poolSize, partSize)
+	rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, rs.data) {
+		t.Fatalf("data mismatch (%d bytes)", len(got))
+	}
+	if elapsed > 2500*time.Millisecond {
+		t.Fatalf("read took %s; the straggler was not split", elapsed)
+	}
+
+	// The server must have seen requests starting strictly inside the
+	// straggling part, and not more of them than the fan-out bound allows.
+	_, starts := rs.stats()
+	inside := 0
+	for _, s := range starts {
+		if s > straggle && s < straggle+partSize {
+			inside++
+		}
+	}
+	if inside == 0 {
+		t.Fatal("no split request was made for the straggling part")
+	}
+	if inside >= hedgeMaxPieces {
+		t.Fatalf("%d split requests for one part exceeds the bound of %d", inside, hedgeMaxPieces-1)
+	}
+	if r, s, _ := poolStats(pool); r != 0 || s != 0 {
+		t.Fatalf("pool not drained: readers=%d held=%d", r, s)
+	}
+}
+
+// TestOpenLTXFile_MultipartStallAbort verifies that a connection which is open
+// but delivering nothing is aborted after stallTimeout and reopened from the
+// same offset, so an idle-but-alive stream cannot block a restore.
+func TestOpenLTXFile_MultipartStallAbort(t *testing.T) {
+	const (
+		partSize = 64 << 10
+		size     = 12 * partSize
+		poolSize = 6
+		stalled  = 3 * partSize
+	)
+	// A huge min piece disables splitting so only the stall path can rescue
+	// the part.
+	hedgeTestSettings(t, 1<<40, 16<<10, 50*time.Millisecond)
+
+	restore := downloadPartBackoff
+	downloadPartBackoff = time.Millisecond
+	t.Cleanup(func() { downloadPartBackoff = restore })
+
+	rs, server := newRangeServer(t, size)
+	rs.hangOnce[stalled] = true
+
+	client, pool := newMultipartTestClient(t, server, poolSize, partSize)
+	rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	var got []byte
+	go func() {
+		var err error
+		got, err = io.ReadAll(rc)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("read did not finish: the stalled connection was never aborted")
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, rs.data) {
+		t.Fatalf("data mismatch (%d bytes)", len(got))
+	}
+
+	if n := requestsPerChunk(rs, partSize)[stalled/partSize]; n != 2 {
+		t.Fatalf("stalled part was requested %d times, want 2 (the hung one and its retry)", n)
+	}
+	if r, s, _ := poolStats(pool); r != 0 || s != 0 {
+		t.Fatalf("pool not drained: readers=%d held=%d", r, s)
 	}
 }
