@@ -22,7 +22,11 @@ import (
 //
 //   - each file's CRC, and the snapshot's post-apply checksum when it carries
 //     one, are verified when that file's decoder is closed;
-//   - page sizes must match and transaction IDs must be contiguous;
+//   - page sizes must match and transaction IDs must be contiguous, by the
+//     same predicate the merge used, so an overlapping file that advances
+//     the maximum TXID is accepted;
+//   - no file may carry SQLite's lock page, which the merge rejected when it
+//     re-encoded the page;
 //   - every page of the final database must have been written by the snapshot
 //     or a delta, which the merge enforced by decoding a dense page stream.
 //
@@ -34,6 +38,7 @@ func applyRestoreDeltas(f *os.File, snapshot ltx.Header, rdrs []io.Reader) error
 	pageSize := snapshot.PageSize
 	written := newPageSet(snapshot.Commit)
 	commit, prevMaxTXID := snapshot.Commit, snapshot.MaxTXID
+	lockPgno := ltx.LockPgno(pageSize)
 	data := make([]byte, pageSize)
 
 	for _, rd := range rdrs {
@@ -45,7 +50,7 @@ func applyRestoreDeltas(f *os.File, snapshot ltx.Header, rdrs []io.Reader) error
 		name := ltx.FormatFilename(hdr.MinTXID, hdr.MaxTXID)
 		if hdr.PageSize != pageSize {
 			return fmt.Errorf("ltx file %s: page size %d does not match snapshot page size %d", name, hdr.PageSize, pageSize)
-		} else if hdr.MinTXID != prevMaxTXID+1 {
+		} else if !ltx.IsContiguous(prevMaxTXID, hdr.MinTXID, hdr.MaxTXID) {
 			return fmt.Errorf("non-contiguous transaction ids in restore plan: %s follows %s", name, prevMaxTXID)
 		}
 
@@ -55,6 +60,9 @@ func applyRestoreDeltas(f *os.File, snapshot ltx.Header, rdrs []io.Reader) error
 				break
 			} else if err != nil {
 				return fmt.Errorf("ltx file %s: decode page: %w", name, err)
+			}
+			if phdr.Pgno == lockPgno {
+				return fmt.Errorf("ltx file %s: contains lock page %d", name, phdr.Pgno)
 			}
 			if _, err := f.WriteAt(data, int64(phdr.Pgno-1)*int64(pageSize)); err != nil {
 				return fmt.Errorf("ltx file %s: write page %d: %w", name, phdr.Pgno, err)
@@ -75,7 +83,7 @@ func applyRestoreDeltas(f *os.File, snapshot ltx.Header, rdrs []io.Reader) error
 		prevMaxTXID = hdr.MaxTXID
 	}
 
-	if pgno := written.firstMissing(commit, ltx.LockPgno(pageSize)); pgno != 0 {
+	if pgno := written.firstMissing(commit, lockPgno); pgno != 0 {
 		return fmt.Errorf("restored database is missing page %d of %d", pgno, commit)
 	}
 	return nil

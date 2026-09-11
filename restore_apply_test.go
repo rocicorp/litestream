@@ -3,6 +3,8 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"hash/crc64"
 	"io"
 	"math/rand"
 	"os"
@@ -173,6 +175,32 @@ func TestReplica_Restore_AppliesDeltasInPlace(t *testing.T) {
 	}
 }
 
+// TestReplica_Restore_OverlappingPlan verifies the plan shape CalcRestorePlan
+// produces when a compacted file covers an earlier file's whole range: a
+// snapshot 1-5 followed by 1-100, with the 50-60 file inside it skipped. The
+// merge accepted this through ltx.IsContiguous, so in-place apply must too.
+func TestReplica_Restore_OverlappingPlan(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	files := []restoreTestFile{
+		{level: litestream.SnapshotLevel, minTXID: 1, maxTXID: 5, commit: 100, pages: restoreTestPages(rng, pageRange(1, 100)...)},
+		{level: 2, minTXID: 1, maxTXID: 100, commit: 110, pages: restoreTestPages(rng, pageRange(1, 110)...)},
+		{level: 2, minTXID: 50, maxTXID: 60, commit: 110, pages: restoreTestPages(rng, 7)},
+	}
+	r, encoded := writeRestoreTestReplica(t, files, nil)
+
+	outputPath := filepath.Join(t.TempDir(), "restored.db")
+	if err := r.Restore(context.Background(), litestream.RestoreOptions{OutputPath: outputPath}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := compactedDatabase(t, encoded[:2]); !bytes.Equal(got, want) {
+		t.Fatalf("restored database differs from the compactor merge of the plan: got %d bytes, want %d", len(got), len(want))
+	}
+}
+
 // TestReplica_Restore_DeltaErrors verifies that a delta which cannot be
 // applied fails the restore and leaves no output behind.
 func TestReplica_Restore_DeltaErrors(t *testing.T) {
@@ -207,6 +235,25 @@ func TestReplica_Restore_DeltaErrors(t *testing.T) {
 				return b
 			},
 			want: "checksum mismatch",
+		},
+		{
+			// A checksum-valid delta whose first page header names SQLite's
+			// lock page. The encoder refuses to write one, so the page number
+			// is patched afterwards and the file checksum recomputed.
+			name: "LockPage",
+			delta: func(rng *rand.Rand) restoreTestFile {
+				lock := ltx.LockPgno(restoreTestPageSize)
+				return restoreTestFile{level: 1, minTXID: 2, maxTXID: 2, commit: lock, pages: restoreTestPages(rng, lock-1)}
+			},
+			mutate: func(i int, b []byte) []byte {
+				if i == 1 {
+					binary.BigEndian.PutUint32(b[ltx.HeaderSize:], ltx.LockPgno(restoreTestPageSize))
+					sum := crc64.Checksum(b[:len(b)-8], crc64.MakeTable(crc64.ISO))
+					binary.BigEndian.PutUint64(b[len(b)-8:], uint64(ltx.ChecksumFlag)|sum)
+				}
+				return b
+			},
+			want: "contains lock page",
 		},
 		{
 			// Stored as 2-2 but its header claims 3-3.
