@@ -737,11 +737,10 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
 
 	// Every stream boundary below is buffered. The LTX decoder issues several
-	// small reads per page (page header, size prefix, compressed block) and
-	// the compactor several small writes; unbuffered, each read is a syscall
-	// or a mutex round trip into the storage reader and each write into the
-	// pipe is a synchronous goroutine handoff. On a multi-GB snapshot that
-	// per-page overhead, not decompression or the network, bounds the restore.
+	// small reads per page (page header, size prefix, compressed block);
+	// unbuffered, each is a syscall or a mutex round trip into the storage
+	// reader, and on a multi-GB snapshot that per-page overhead, not
+	// decompression or the network, bounds the restore.
 	const restoreBufSize = 1 << 20
 
 	rdrs := make([]io.Reader, 0, len(infos))
@@ -783,7 +782,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Output to temp file & atomically rename.
 	tmpOutputPath := opt.OutputPath + ".tmp"
-	r.Logger().Debug("compacting into database", "path", tmpOutputPath, "n", len(rdrs))
+	r.Logger().Debug("restoring into database", "path", tmpOutputPath, "n", len(rdrs))
 	defer func() { _ = os.Remove(tmpOutputPath) }()
 
 	f, err := os.Create(tmpOutputPath)
@@ -792,41 +791,20 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 	defer func() { _ = f.Close() }()
 
+	// A plan is a snapshot followed by zero or more deltas in TXID order.
+	// Decode the snapshot straight into the file, then write each delta's
+	// pages in place; applyRestoreDeltas explains why this replaces merging
+	// every file through a compactor.
 	fw := bufio.NewWriterSize(f, restoreBufSize)
-	if len(rdrs) == 1 {
-		// A one-file plan is a bare snapshot, so decode it straight to the
-		// database. Routing it through the compactor would decompress,
-		// recompress and re-hash every page only to decompress it again on
-		// the other side of a pipe, roughly doubling the CPU per page. The
-		// decoder still verifies the file and post-apply checksums on close.
-		if err := ltx.NewDecoder(rdrs[0]).DecodeDatabaseTo(fw); err != nil {
-			return fmt.Errorf("decode database: %w", err)
-		}
-	} else {
-		pr, pw := io.Pipe()
-
-		go func() {
-			bw := bufio.NewWriterSize(pw, restoreBufSize)
-			c, err := ltx.NewCompactor(bw, rdrs)
-			if err != nil {
-				pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
-				return
-			}
-			c.HeaderFlags = ltx.HeaderFlagNoChecksum
-			if err := c.Compact(ctx); err != nil {
-				_ = pw.CloseWithError(err)
-				return
-			}
-			_ = pw.CloseWithError(bw.Flush())
-		}()
-
-		dec := ltx.NewDecoder(bufio.NewReaderSize(pr, restoreBufSize))
-		if err := dec.DecodeDatabaseTo(fw); err != nil {
-			return fmt.Errorf("decode database: %w", err)
-		}
+	snapshot := ltx.NewDecoder(rdrs[0])
+	if err := snapshot.DecodeDatabaseTo(fw); err != nil {
+		return fmt.Errorf("decode database: %w", err)
 	}
 	if err := fw.Flush(); err != nil {
 		return fmt.Errorf("flush database: %w", err)
+	}
+	if err := applyRestoreDeltas(f, snapshot.Header(), rdrs[1:]); err != nil {
+		return fmt.Errorf("apply ltx files: %w", err)
 	}
 
 	if err := f.Sync(); err != nil {
