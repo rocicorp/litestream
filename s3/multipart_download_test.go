@@ -1380,3 +1380,57 @@ func TestOpenLTXFile_MultipartStallAbort(t *testing.T) {
 		t.Fatalf("pool not drained: readers=%d held=%d", r, s)
 	}
 }
+
+// TestOpenLTXFile_MultipartLiveStallAbort verifies that the live chunk, which
+// is read on the consumer's goroutine and never waited on through the pool, is
+// also protected by the stall watchdog: a hung response on the request that
+// opened the download is closed after stallTimeout and reopened from offset 0.
+func TestOpenLTXFile_MultipartLiveStallAbort(t *testing.T) {
+	const (
+		partSize = 64 << 10
+		size     = 12 * partSize
+		poolSize = 6
+	)
+	hedgeTestSettings(t, 1<<40, 16<<10, 50*time.Millisecond)
+
+	restore := downloadPartBackoff
+	downloadPartBackoff = time.Millisecond
+	t.Cleanup(func() { downloadPartBackoff = restore })
+
+	rs, server := newRangeServer(t, size)
+	rs.hangOnce[0] = true
+
+	client, pool := newMultipartTestClient(t, server, poolSize, partSize)
+	rc, err := client.OpenLTXFile(context.Background(), 0, 1, 1, 0, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	var got []byte
+	go func() {
+		var err error
+		got, err = io.ReadAll(rc)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("read did not finish: the hung live connection was never aborted")
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, rs.data) {
+		t.Fatalf("data mismatch (%d bytes)", len(got))
+	}
+	if n := requestsPerChunk(rs, partSize)[0]; n != 2 {
+		t.Fatalf("live part was requested %d times, want 2 (the hung one and its reopen)", n)
+	}
+	if r, s, _ := poolStats(pool); r != 0 || s != 0 {
+		t.Fatalf("pool not drained: readers=%d held=%d", r, s)
+	}
+}
