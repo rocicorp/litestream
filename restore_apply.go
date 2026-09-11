@@ -25,14 +25,16 @@ import (
 //   - page sizes must match and transaction IDs must be contiguous, by the
 //     same predicate the merge used, so an overlapping file that advances
 //     the maximum TXID is accepted;
-//   - no file may carry SQLite's lock page, which the merge rejected when it
-//     re-encoded the page;
+//   - pages must be strictly increasing and within the file's commit size,
+//     and no file may carry SQLite's lock page, all of which the merge
+//     enforced by re-encoding every page;
 //   - every page of the final database must have been written by the snapshot
 //     or a delta, which the merge enforced by decoding a dense page stream.
 //
 // After each file the database is truncated to that file's commit size, which
 // drops pages an earlier file wrote and the database later freed, as the merge
-// did by skipping pages beyond the final commit. Page 1 is written verbatim:
+// did by skipping pages beyond the final commit. A commit size of zero is an
+// empty database, and truncates the file to zero as the merge's output did. Page 1 is written verbatim:
 // the journal-mode rewrite in applyLTXFile is for follow mode's live readers.
 func applyRestoreDeltas(f *os.File, snapshot ltx.Header, rdrs []io.Reader) error {
 	pageSize := snapshot.PageSize
@@ -54,6 +56,7 @@ func applyRestoreDeltas(f *os.File, snapshot ltx.Header, rdrs []io.Reader) error
 			return fmt.Errorf("non-contiguous transaction ids in restore plan: %s follows %s", name, prevMaxTXID)
 		}
 
+		var prevPgno uint32
 		for {
 			var phdr ltx.PageHeader
 			if err := dec.DecodePage(&phdr, data); err == io.EOF {
@@ -61,9 +64,15 @@ func applyRestoreDeltas(f *os.File, snapshot ltx.Header, rdrs []io.Reader) error
 			} else if err != nil {
 				return fmt.Errorf("ltx file %s: decode page: %w", name, err)
 			}
-			if phdr.Pgno == lockPgno {
+			switch {
+			case phdr.Pgno <= prevPgno:
+				return fmt.Errorf("ltx file %s: page %d out of order after page %d", name, phdr.Pgno, prevPgno)
+			case phdr.Pgno > hdr.Commit:
+				return fmt.Errorf("ltx file %s: page %d beyond commit size %d", name, phdr.Pgno, hdr.Commit)
+			case phdr.Pgno == lockPgno:
 				return fmt.Errorf("ltx file %s: contains lock page %d", name, phdr.Pgno)
 			}
+			prevPgno = phdr.Pgno
 			if _, err := f.WriteAt(data, int64(phdr.Pgno-1)*int64(pageSize)); err != nil {
 				return fmt.Errorf("ltx file %s: write page %d: %w", name, phdr.Pgno, err)
 			}
@@ -73,13 +82,11 @@ func applyRestoreDeltas(f *os.File, snapshot ltx.Header, rdrs []io.Reader) error
 			return fmt.Errorf("ltx file %s: %w", name, err)
 		}
 
-		if hdr.Commit > 0 {
-			commit = hdr.Commit
-			if err := f.Truncate(int64(commit) * int64(pageSize)); err != nil {
-				return fmt.Errorf("ltx file %s: truncate to %d pages: %w", name, commit, err)
-			}
-			written.truncate(commit)
+		commit = hdr.Commit
+		if err := f.Truncate(int64(commit) * int64(pageSize)); err != nil {
+			return fmt.Errorf("ltx file %s: truncate to %d pages: %w", name, commit, err)
 		}
+		written.truncate(commit)
 		prevMaxTXID = hdr.MaxTXID
 	}
 
