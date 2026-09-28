@@ -4898,3 +4898,187 @@ func TestDB_SnapshotReaderDuringClose(t *testing.T) {
 		})
 	}
 }
+
+// spillProbeStagingFile wraps an LTX staging file and, on every write, records
+// whether an encoder page-index spill file exists in the meta directory. Once
+// a snapshot has encoded more pages than the spill threshold, each later page
+// write happens while the spill file exists, so this observes the spill
+// deterministically. With failAfterSpill set, the first write that sees the
+// spill fails, abandoning the encoder mid-file.
+type spillProbeStagingFile struct {
+	ltxStagingFile
+	metaPath       string
+	failAfterSpill bool
+	sawSpill       *atomic.Bool
+}
+
+func (f *spillProbeStagingFile) Write(p []byte) (int, error) {
+	if len(spillFiles(f.metaPath)) > 0 {
+		f.sawSpill.Store(true)
+		if f.failAfterSpill {
+			return 0, errors.New("injected staging write failure")
+		}
+	}
+	return f.ltxStagingFile.Write(p)
+}
+
+// spillProbeReader records whether a spill file exists in metaPath after each
+// read of a snapshot stream. The snapshot encoder writes through a pipe, so a
+// read returning a page past the spill threshold happens after the spill file
+// was created and before Close removes it.
+type spillProbeReader struct {
+	io.Reader
+	metaPath string
+	sawSpill *atomic.Bool
+}
+
+func (r *spillProbeReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if len(spillFiles(r.metaPath)) > 0 {
+		r.sawSpill.Store(true)
+	}
+	return n, err
+}
+
+type spillProbeClient struct {
+	*testReplicaClient
+	metaPath string
+	sawSpill atomic.Bool
+}
+
+func (c *spillProbeClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	return c.testReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, &spillProbeReader{Reader: r, metaPath: c.metaPath, sawSpill: &c.sawSpill})
+}
+
+func spillFiles(metaPath string) []string {
+	matches, _ := filepath.Glob(filepath.Join(metaPath, ".ltx-page-index-*.tmp"))
+	return matches
+}
+
+// openSpillTestDB opens a DB whose snapshot encoders spill after a handful of
+// pages, and a SQL connection holding enough rows to exceed that threshold.
+func openSpillTestDB(t *testing.T, failAfterSpill bool) (*DB, *atomic.Bool) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "db")
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqldb.Close() })
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	for range 50 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (randomblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.spillThreshold = 4
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	var sawSpill atomic.Bool
+	db.openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+		f, err := defaultOpenLTXFile(name, flag, perm)
+		if err != nil {
+			return nil, err
+		}
+		return &spillProbeStagingFile{ltxStagingFile: f, metaPath: db.MetaPath(), failAfterSpill: failAfterSpill, sawSpill: &sawSpill}, nil
+	}
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close(context.Background()) })
+	return db, &sawSpill
+}
+
+// decodeLTXFile fully decodes an LTX file, which validates its page index
+// against the decoded pages, and returns the number of pages it holds.
+func decodeLTXFile(t *testing.T, r io.Reader) int {
+	t.Helper()
+	dec := ltx.NewDecoder(r)
+	var db bytes.Buffer
+	if err := dec.DecodeDatabaseTo(&db); err != nil {
+		t.Fatal(err)
+	}
+	return db.Len() / int(dec.Header().PageSize)
+}
+
+func TestDB_SnapshotEncodersSpillPageIndex(t *testing.T) {
+	t.Run("SyncPathBase", func(t *testing.T) {
+		db, sawSpill := openSpillTestDB(t, false)
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if !sawSpill.Load() {
+			t.Fatal("expected the base snapshot's page index to spill")
+		}
+		if files := spillFiles(db.MetaPath()); len(files) != 0 {
+			t.Fatalf("spill files left behind: %v", files)
+		}
+
+		pos, err := db.Pos()
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(db.LTXPath(0, 1, pos.TXID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if n := decodeLTXFile(t, f); n <= db.spillThreshold {
+			t.Fatalf("base snapshot has %d pages, want more than spill threshold %d", n, db.spillThreshold)
+		}
+	})
+
+	t.Run("SyncPathFailureCleansUp", func(t *testing.T) {
+		db, sawSpill := openSpillTestDB(t, true)
+		if err := db.Sync(context.Background()); err == nil {
+			t.Fatal("expected sync to fail on injected staging write failure")
+		}
+		if !sawSpill.Load() {
+			t.Fatal("expected the failure to occur after the spill started")
+		}
+		if files := spillFiles(db.MetaPath()); len(files) != 0 {
+			t.Fatalf("spill files left behind after failed sync: %v", files)
+		}
+	})
+
+	t.Run("Snapshot", func(t *testing.T) {
+		db, _ := openSpillTestDB(t, false)
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		client := &spillProbeClient{testReplicaClient: db.Replica.Client.(*testReplicaClient), metaPath: db.MetaPath()}
+		db.Replica.Client = client
+		info, err := db.Snapshot(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !client.sawSpill.Load() {
+			t.Fatal("expected the snapshot's page index to spill")
+		}
+		if files := spillFiles(db.MetaPath()); len(files) != 0 {
+			t.Fatalf("spill files left behind: %v", files)
+		}
+		rc, err := db.Replica.Client.OpenLTXFile(context.Background(), SnapshotLevel, info.MinTXID, info.MaxTXID, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rc.Close()
+		if n := decodeLTXFile(t, rc); n <= db.spillThreshold {
+			t.Fatalf("snapshot has %d pages, want more than spill threshold %d", n, db.spillThreshold)
+		}
+	})
+}
