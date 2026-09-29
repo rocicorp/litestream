@@ -3471,11 +3471,13 @@ func (db *DB) monitor() {
 
 	for {
 		// Wait for ticker, a sync request, or context close.
+		requested := false
 		select {
 		case <-db.ctx.Done():
 			return
 		case <-ticker.C:
 		case <-db.syncNow:
+			requested = true
 		}
 
 		// If in backoff mode, wait additional time before retrying.
@@ -3496,6 +3498,12 @@ func (db *DB) monitor() {
 		db.beginSyncPass()
 		err := db.Sync(db.ctx)
 		db.endSyncPass(err)
+		if requested {
+			// While sync requests keep arriving they drive all syncs; the tick
+			// only fires once they stop for a full interval. Reset after the
+			// pass so a long pass isn't followed by an immediate tick.
+			ticker.Reset(db.MonitorInterval)
+		}
 		if err != nil && !errors.Is(err, context.Canceled) {
 			consecutiveErrs++
 

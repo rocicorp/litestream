@@ -152,6 +152,40 @@ func TestDB_RequestSync_CoalescesWhileSyncInProgress(t *testing.T) {
 	}
 }
 
+// While sync requests keep arriving they drive all syncs: each requested pass
+// resets the monitor tick, which only fires once requests stop for a full
+// interval. Otherwise the two schedules would each seal their own LTX files.
+func TestDB_RequestSync_PostponesMonitorTick(t *testing.T) {
+	const interval = 200 * time.Millisecond
+	db, _ := openMonitoredDB(t, &testReplicaClient{dir: t.TempDir()}, func(db *DB) {
+		db.MonitorInterval = interval
+	})
+
+	// The ticker starts at Open, so count passes from the first request on.
+	if err := db.RequestSync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	baseline, _, _ := syncPasses(db)
+
+	// Five intervals' worth of requests, each well within an interval of the last.
+	const requests = 20
+	for range requests {
+		time.Sleep(interval / 4)
+		if err := db.RequestSync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if started, _, _ := syncPasses(db); started != baseline+requests {
+		t.Fatalf("started=%d, want %d: the monitor tick fired while requests were arriving",
+			started, baseline+requests)
+	}
+
+	waitFor(t, "monitor tick after requests stop", func() bool {
+		started, _, _ := syncPasses(db)
+		return started > baseline+requests
+	})
+}
+
 // A request must only be satisfied by a pass that started after the request,
 // because a pass that was already in progress may have read the WAL before the
 // requester's latest commit.
