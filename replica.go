@@ -36,8 +36,9 @@ var errReplicaWaitForData = errors.New("no position, waiting for data")
 type Replica struct {
 	db *DB
 
-	mu  sync.RWMutex
-	pos ltx.Pos // current replicated position
+	mu        sync.RWMutex
+	pos       ltx.Pos       // current replicated position
+	posNotify chan struct{} // closed and replaced when pos is set; see WaitForPos
 
 	syncSem     *semaphore.Weighted
 	syncWaiters atomic.Int64 // diagnostic instrumentation: goroutines queued on syncSem
@@ -71,9 +72,10 @@ type Replica struct {
 
 func NewReplica(db *DB) *Replica {
 	r := &Replica{
-		db:      db,
-		syncSem: semaphore.NewWeighted(1),
-		cancel:  func() {},
+		db:        db,
+		syncSem:   semaphore.NewWeighted(1),
+		posNotify: make(chan struct{}),
+		cancel:    func() {},
 
 		SyncInterval:    DefaultSyncInterval,
 		MaxSyncLTXFiles: DefaultMaxSyncLTXFiles,
@@ -355,6 +357,32 @@ func (r *Replica) SetPos(pos ltx.Pos) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.pos = pos
+	if r.posNotify != nil {
+		close(r.posNotify)
+		r.posNotify = make(chan struct{})
+	}
+}
+
+// WaitForPos blocks until the replicated position reaches txID, i.e. until
+// every LTX file up to txID has been uploaded by the replica's monitor. It does
+// not upload anything itself, so canceling ctx only abandons the wait.
+func (r *Replica) WaitForPos(ctx context.Context, txID ltx.TXID) error {
+	for {
+		r.mu.RLock()
+		pos, notify := r.pos, r.posNotify
+		r.mu.RUnlock()
+		if pos.TXID >= txID {
+			return nil
+		}
+
+		select {
+		case <-notify:
+		case <-ctx.Done():
+			return fmt.Errorf("wait for replica position %s (at %s): %w", txID, pos.TXID, context.Cause(ctx))
+		case <-r.db.ctx.Done():
+			return ErrDatabaseNotOpen
+		}
+	}
 }
 
 // EnforceRetention forces a new snapshot once the retention interval has passed.
