@@ -899,6 +899,12 @@ func (db *DB) requestOrSync(ctx context.Context) error {
 // Requests made while a pass is in progress coalesce into a single follow-up
 // pass. Requires the monitor to be running (MonitorInterval > 0).
 func (db *DB) RequestSync(ctx context.Context) error {
+	if !db.IsOpen() {
+		return ErrDatabaseNotOpen
+	}
+	if db.MonitorInterval <= 0 {
+		return fmt.Errorf("database monitor disabled")
+	}
 	// Read the target before triggering: any pass that has already started may
 	// have read the WAL before the caller's latest commit.
 	db.passes.Lock()
