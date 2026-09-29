@@ -88,7 +88,7 @@ func mustInsert(t *testing.T, sqldb *sql.DB) {
 func TestDB_RequestSync_SealsCommittedWrites(t *testing.T) {
 	db, sqldb := openMonitoredDB(t, &testReplicaClient{dir: t.TempDir()})
 
-	if err := db.RequestSync(t.Context()); err != nil {
+	if err := db.requestSync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	before, err := db.Pos()
@@ -97,7 +97,7 @@ func TestDB_RequestSync_SealsCommittedWrites(t *testing.T) {
 	}
 
 	mustInsert(t, sqldb)
-	if err := db.RequestSync(t.Context()); err != nil {
+	if err := db.requestSync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	after, err := db.Pos()
@@ -117,7 +117,7 @@ func TestDB_RequestSync_CoalescesWhileSyncInProgress(t *testing.T) {
 	// Stall the next pass on the executor lock, as a long sync would.
 	mustAcquireSemaphore(db.execSem)
 	first := make(chan error, 1)
-	go func() { first <- db.RequestSync(context.Background()) }()
+	go func() { first <- db.requestSync(context.Background()) }()
 	waitFor(t, "first pass to start", func() bool {
 		started, _, _ := syncPasses(db)
 		return started == 1
@@ -126,7 +126,7 @@ func TestDB_RequestSync_CoalescesWhileSyncInProgress(t *testing.T) {
 	mustInsert(t, sqldb)
 	for range 10 {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
-		err := db.RequestSync(ctx)
+		err := db.requestSync(ctx)
 		cancel()
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("err=%v, want deadline exceeded", err)
@@ -162,7 +162,7 @@ func TestDB_RequestSync_PostponesMonitorTick(t *testing.T) {
 	})
 
 	// The ticker starts at Open, so count passes from the first request on.
-	if err := db.RequestSync(t.Context()); err != nil {
+	if err := db.requestSync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	baseline, _, _ := syncPasses(db)
@@ -171,7 +171,7 @@ func TestDB_RequestSync_PostponesMonitorTick(t *testing.T) {
 	const requests = 20
 	for range requests {
 		time.Sleep(interval / 4)
-		if err := db.RequestSync(t.Context()); err != nil {
+		if err := db.requestSync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -194,7 +194,7 @@ func TestDB_RequestSync_WaitsForPassStartedAfterRequest(t *testing.T) {
 
 	mustAcquireSemaphore(db.execSem)
 	first := make(chan error, 1)
-	go func() { first <- db.RequestSync(context.Background()) }()
+	go func() { first <- db.requestSync(context.Background()) }()
 	waitFor(t, "first pass to start", func() bool {
 		started, _, _ := syncPasses(db)
 		return started == 1
@@ -203,7 +203,7 @@ func TestDB_RequestSync_WaitsForPassStartedAfterRequest(t *testing.T) {
 	mustInsert(t, sqldb)
 	second := make(chan uint64, 1)
 	go func() {
-		if err := db.RequestSync(context.Background()); err != nil {
+		if err := db.requestSync(context.Background()); err != nil {
 			t.Error(err)
 		}
 		_, done, _ := syncPasses(db)
@@ -227,7 +227,7 @@ func TestDB_RequestSync_CancelDoesNotInterruptSync(t *testing.T) {
 	mustInsert(t, sqldb)
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- db.RequestSync(ctx) }()
+	go func() { errCh <- db.requestSync(ctx) }()
 	waitFor(t, "pass to start", func() bool {
 		started, _, _ := syncPasses(db)
 		return started == 1

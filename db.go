@@ -887,18 +887,18 @@ func (db *DB) requestOrSync(ctx context.Context) error {
 	if db.MonitorInterval <= 0 {
 		return db.Sync(ctx)
 	}
-	return db.RequestSync(ctx)
+	return db.requestSync(ctx)
 }
 
-// RequestSync asks the background monitor to run a sync pass immediately and
+// requestSync asks the background monitor to run a sync pass immediately and
 // waits until a pass that started after this call has completed, returning
 // that pass's error. Because a pass syncs up to the end of the WAL, every
 // transaction committed before the call is sealed into an LTX file on success.
 //
-// RequestSync never runs a sync itself: canceling ctx only abandons the wait.
+// requestSync never runs a sync itself: canceling ctx only abandons the wait.
 // Requests made while a pass is in progress coalesce into a single follow-up
 // pass. Requires the monitor to be running (MonitorInterval > 0).
-func (db *DB) RequestSync(ctx context.Context) error {
+func (db *DB) requestSync(ctx context.Context) error {
 	if !db.IsOpen() {
 		return ErrDatabaseNotOpen
 	}
