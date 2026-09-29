@@ -44,7 +44,7 @@ func applyRestoreDeltas(f *os.File, snapshot ltx.Header, rdrs []io.Reader) error
 	data := make([]byte, pageSize)
 
 	for _, rd := range rdrs {
-		dec := ltx.NewDecoder(rd)
+		dec := newRestoreDecoder(rd)
 		if err := dec.DecodeHeader(); err != nil {
 			return fmt.Errorf("decode header of ltx file after %s: %w", prevMaxTXID, err)
 		}

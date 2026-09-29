@@ -107,6 +107,11 @@ type DB struct {
 	// inject filesystem errors such as ENOSPC.
 	openLTXFile func(name string, flag int, perm os.FileMode) (ltxStagingFile, error)
 
+	// spillThreshold overrides the number of in-memory page index entries at
+	// which the snapshot encoders spill to the meta directory; zero keeps the
+	// ltx default. Lowered in tests to exercise the spill on small databases.
+	spillThreshold int
+
 	ctx    context.Context
 	cancel func()
 	wg     sync.WaitGroup
@@ -1226,6 +1231,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 	if err := internal.MkdirAll(db.metaPath, db.dirInfo); err != nil {
 		return err
 	}
+	db.compactor.SpillDir = db.metaPath
 
 	// Ensure WAL has at least one frame in it.
 	if err := db.ensureWALExists(ctx); err != nil {
@@ -2289,6 +2295,13 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	if err != nil {
 		return result, fmt.Errorf("new ltx encoder: %w", err)
 	}
+	// Snapshotting syncs encode every page of the database; past the
+	// encoder's threshold their page index spills into the meta directory
+	// rather than being held in memory. Cleanup covers the error paths that
+	// never reach enc.Close.
+	enc.SetSpillThreshold(db.spillThreshold)
+	enc.SetSpillDir(db.metaPath)
+	defer func() { _ = enc.Cleanup() }()
 	if err := enc.EncodeHeader(ltx.Header{
 		Version:   ltx.Version,
 		Flags:     ltx.HeaderFlagNoChecksum,
@@ -3054,6 +3067,12 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			pw.CloseWithError(fmt.Errorf("new ltx encoder: %w", err))
 			return
 		}
+		// Very large snapshots spill their page index into the meta
+		// directory rather than holding it in memory; Cleanup covers the
+		// cancellation paths that never reach enc.Close.
+		enc.SetSpillDir(db.MetaPath())
+		defer func() { _ = enc.Cleanup() }()
+		enc.SetSpillThreshold(db.spillThreshold)
 		if err := enc.EncodeHeader(ltx.Header{
 			Version:   ltx.Version,
 			Flags:     ltx.HeaderFlagNoChecksum,

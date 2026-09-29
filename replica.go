@@ -638,6 +638,29 @@ func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (up
 	return updatedAt, nil
 }
 
+// newRestoreDecoder returns an LTX decoder for paths that materialize a
+// database file and never read the decoder's page index. Retaining the index
+// would build a map with one entry per page, which dominates peak memory when
+// restoring large databases (#1486). Close still validates the index either way.
+func newRestoreDecoder(r io.Reader) *ltx.Decoder {
+	dec := ltx.NewDecoder(r)
+	dec.SetRetainPageIndex(false)
+	return dec
+}
+
+// newRestoreCompactor returns an LTX compactor for restore paths. Its output
+// page index spills into spillDir past the encoder's threshold, so compacting
+// a large database does not hold a per-page index in memory either (#1486).
+func newRestoreCompactor(w io.Writer, rdrs []io.Reader, spillDir string) (*ltx.Compactor, error) {
+	c, err := ltx.NewCompactor(w, rdrs)
+	if err != nil {
+		return nil, err
+	}
+	c.HeaderFlags = ltx.HeaderFlagNoChecksum
+	c.SetSpillDir(spillDir)
+	return c, nil
+}
+
 // Replica restores the database from a replica based on the options given.
 // This method will restore into opt.OutputPath, if specified, or into the
 // DB's original database path. It can optionally restore from a specific
@@ -731,6 +754,8 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	if err != nil {
 		return fmt.Errorf("cannot calc restore plan: %w", err)
 	}
+	restoreCtx, cancelRestore := context.WithCancel(ctx)
+	defer cancelRestore()
 
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
 
@@ -760,7 +785,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
-		rr := internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger())
+		rr := internal.NewResumableReader(restoreCtx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger())
 		closers = append(closers, rr)
 		rdrs = append(rdrs, bufio.NewReaderSize(rr, restoreBufSize))
 	}
@@ -794,7 +819,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// pages in place; applyRestoreDeltas explains why this replaces merging
 	// every file through a compactor.
 	fw := bufio.NewWriterSize(f, restoreBufSize)
-	snapshot := ltx.NewDecoder(rdrs[0])
+	snapshot := newRestoreDecoder(rdrs[0])
 	if err := snapshot.DecodeDatabaseTo(fw); err != nil {
 		return fmt.Errorf("decode database: %w", err)
 	}
@@ -1002,7 +1027,7 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 	}
 	defer rc.Close()
 
-	dec := ltx.NewDecoder(rc)
+	dec := newRestoreDecoder(rc)
 	if err := dec.DecodeHeader(); err != nil {
 		return fmt.Errorf("decode header: %w", err)
 	}
