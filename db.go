@@ -75,6 +75,7 @@ type DB struct {
 	rtx          *sql.Tx       // long running read transaction
 	pageSize     int           // page size, in bytes
 	notify       chan struct{} // closes on WAL change
+	syncNow      chan struct{} // requests an immediate monitor sync pass; cap 1 so requests coalesce
 	chkMu        sync.RWMutex  // checkpoint lock
 	opened       bool          // true if Open() was called and Close() not yet called
 	syncState    syncState
@@ -91,6 +92,16 @@ type DB struct {
 	pos struct {
 		sync.Mutex
 		value *ltx.Pos
+	}
+
+	// Monitor sync passes. RequestSync uses these to wait for a pass that
+	// starts after the request, without running a sync itself.
+	passes struct {
+		sync.Mutex
+		started uint64        // incremented before a pass reads any WAL state
+		done    uint64        // incremented when a pass completes
+		err     error         // result of the most recently completed pass
+		notify  chan struct{} // closed and replaced when a pass completes
 	}
 
 	// Final WAL frame captured by the most recent LTX write. verify() uses it
@@ -325,6 +336,7 @@ func NewDB(path string) *DB {
 		metaPath: filepath.Join(dir, "."+file+MetaDirSuffix),
 		execSem:  semaphore.NewWeighted(1),
 		notify:   make(chan struct{}),
+		syncNow:  make(chan struct{}, 1),
 
 		MinCheckpointPageN:   DefaultMinCheckpointPageN,
 		TruncatePageN:        DefaultTruncatePageN,
@@ -339,6 +351,7 @@ func NewDB(path string) *DB {
 		Logger:               slog.With(LogKeyDB, filepath.Base(path)),
 	}
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
+	db.passes.notify = make(chan struct{})
 	db.openLTXFile = defaultOpenLTXFile
 
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
@@ -835,18 +848,108 @@ func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
 
 // SyncAndWait performs a full sync: WAL to LTX files, then LTX files to remote
 // replica. Blocks until both stages complete.
+//
+// When the background monitors are running, the sync and the upload are
+// performed by them rather than by the caller: SyncAndWait only requests a
+// sync pass and waits for the replica to reach the resulting position. Canceling
+// ctx therefore abandons the wait without interrupting the (possibly long)
+// sync or upload, and concurrent callers coalesce onto the same pass.
 func (db *DB) SyncAndWait(ctx context.Context) error {
 	if db.Replica == nil {
 		return fmt.Errorf("no replica configured")
 	}
 
-	if err := db.Sync(ctx); err != nil {
+	if err := db.requestOrSync(ctx); err != nil {
 		return fmt.Errorf("db sync: %w", err)
 	}
-	if err := db.Replica.Sync(ctx); err != nil {
+
+	if !db.Replica.MonitorEnabled {
+		if err := db.Replica.Sync(ctx); err != nil {
+			return fmt.Errorf("replica sync: %w", err)
+		}
+		return nil
+	}
+
+	pos, err := db.Pos()
+	if err != nil {
+		return fmt.Errorf("db position: %w", err)
+	}
+	if err := db.Replica.WaitForPos(ctx, pos.TXID); err != nil {
 		return fmt.Errorf("replica sync: %w", err)
 	}
 	return nil
+}
+
+// requestOrSync syncs the database to the current end of the WAL. If the
+// background monitor is running, the sync is requested from it (see
+// RequestSync); otherwise it is performed directly on the caller's goroutine.
+func (db *DB) requestOrSync(ctx context.Context) error {
+	if db.MonitorInterval <= 0 {
+		return db.Sync(ctx)
+	}
+	return db.RequestSync(ctx)
+}
+
+// RequestSync asks the background monitor to run a sync pass immediately and
+// waits until a pass that started after this call has completed, returning
+// that pass's error. Because a pass syncs up to the end of the WAL, every
+// transaction committed before the call is sealed into an LTX file on success.
+//
+// RequestSync never runs a sync itself: canceling ctx only abandons the wait.
+// Requests made while a pass is in progress coalesce into a single follow-up
+// pass. Requires the monitor to be running (MonitorInterval > 0).
+func (db *DB) RequestSync(ctx context.Context) error {
+	// Read the target before triggering: any pass that has already started may
+	// have read the WAL before the caller's latest commit.
+	db.passes.Lock()
+	target := db.passes.started + 1
+	db.passes.Unlock()
+
+	select {
+	case db.syncNow <- struct{}{}:
+	default: // a pass is already pending; it satisfies this request too
+	}
+
+	for {
+		db.passes.Lock()
+		done, err, notify := db.passes.done, db.passes.err, db.passes.notify
+		db.passes.Unlock()
+		if done >= target {
+			return err
+		}
+
+		select {
+		case <-notify:
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-db.ctx.Done():
+			return ErrDatabaseNotOpen
+		}
+	}
+}
+
+// beginSyncPass marks the start of a monitor sync pass. It must be called
+// before the pass reads any WAL state; see RequestSync.
+func (db *DB) beginSyncPass() {
+	// Consume any pending request: the pass that is about to start satisfies it.
+	select {
+	case <-db.syncNow:
+	default:
+	}
+
+	db.passes.Lock()
+	db.passes.started++
+	db.passes.Unlock()
+}
+
+// endSyncPass records the completion of a monitor sync pass and wakes waiters.
+func (db *DB) endSyncPass(err error) {
+	db.passes.Lock()
+	defer db.passes.Unlock()
+	db.passes.done++
+	db.passes.err = err
+	close(db.passes.notify)
+	db.passes.notify = make(chan struct{})
 }
 
 // EnsureExists restores the database from the configured replica if the local
@@ -3367,11 +3470,12 @@ func (db *DB) monitor() {
 	var consecutiveErrs int
 
 	for {
-		// Wait for ticker or context close.
+		// Wait for ticker, a sync request, or context close.
 		select {
 		case <-db.ctx.Done():
 			return
 		case <-ticker.C:
+		case <-db.syncNow:
 		}
 
 		// If in backoff mode, wait additional time before retrying.
@@ -3389,7 +3493,10 @@ func (db *DB) monitor() {
 		// end so checkpointIfNeeded() runs. A single bounded chunk per
 		// tick would cap drain throughput and starve the TruncatePageN
 		// emergency checkpoint while behind, growing the WAL unbounded.
-		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
+		db.beginSyncPass()
+		err := db.Sync(db.ctx)
+		db.endSyncPass(err)
+		if err != nil && !errors.Is(err, context.Canceled) {
 			consecutiveErrs++
 
 			// Exponential backoff: MonitorInterval -> 2x -> 4x -> ... -> max

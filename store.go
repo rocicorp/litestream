@@ -521,7 +521,7 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResul
 			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
 		}
 	} else {
-		if err := db.Sync(ctx); err != nil {
+		if err := db.requestOrSync(ctx); err != nil {
 			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
 		}
 	}

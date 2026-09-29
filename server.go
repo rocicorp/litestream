@@ -89,7 +89,12 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 
-	s.httpServer = &http.Server{Handler: mux}
+	s.httpServer = &http.Server{
+		Handler: mux,
+		// Request contexts derive from the server context, so they are
+		// canceled on shutdown as well as when the client disconnects.
+		BaseContext: func(net.Listener) context.Context { return ctx },
+	}
 
 	return s
 }
@@ -418,13 +423,16 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := s.ctx
+	// The request only waits for syncs performed by the background monitors
+	// (see DB.RequestSync), so it is safe to abandon the wait when the client
+	// disconnects or the timeout elapses; the sync itself is not interrupted.
+	ctx := r.Context()
 	if req.Wait && req.Timeout == 0 {
 		req.Timeout = 30
 	}
 	if req.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(s.ctx, time.Duration(req.Timeout)*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(req.Timeout)*time.Second)
 		defer cancel()
 	}
 

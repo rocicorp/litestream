@@ -657,6 +657,57 @@ func TestServer_HandleSync(t *testing.T) {
 	})
 }
 
+// With the background monitors running, /sync requests a monitor pass and
+// waits for it (and, with wait, for its upload) instead of syncing on the
+// request goroutine.
+func TestServer_HandleSync_Monitored(t *testing.T) {
+	dbPath := t.TempDir() + "/db"
+	db := testingutil.NewDB(t, dbPath)
+	db.MonitorInterval = time.Hour // passes only run when requested
+	db.ShutdownSyncTimeout = 0
+	db.Replica = litestream.NewReplicaWithClient(db, testingutil.NewFileReplicaClient(t))
+	db.Replica.SyncInterval = 10 * time.Millisecond
+
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+	store.CompactionMonitorEnabled = false
+	require.NoError(t, store.Open(t.Context()))
+	defer store.Close(t.Context())
+
+	sqldb := testingutil.MustOpenSQLDB(t, dbPath)
+	defer sqldb.Close()
+	_, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT)`)
+	require.NoError(t, err)
+
+	server := litestream.NewServer(store)
+	server.SocketPath = testSocketPath(t)
+	require.NoError(t, server.Start())
+	defer server.Close()
+	client := newSocketClient(t, server.SocketPath)
+
+	post := func(body string) litestream.SyncResponse {
+		t.Helper()
+		resp, err := client.Post("http://localhost/sync", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var result litestream.SyncResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		return result
+	}
+
+	local := post(fmt.Sprintf(`{"path": %q}`, dbPath))
+	require.Equal(t, "synced_local", local.Status)
+	require.Greater(t, local.TXID, uint64(0))
+
+	_, err = sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (1)`)
+	require.NoError(t, err)
+
+	waited := post(fmt.Sprintf(`{"path": %q, "wait": true, "timeout": 10}`, dbPath))
+	require.Equal(t, "synced", waited.Status)
+	require.Greater(t, waited.TXID, local.TXID)
+	require.GreaterOrEqual(t, waited.ReplicatedTXID, waited.TXID)
+}
+
 func TestServer_HandleSyncStatus(t *testing.T) {
 	t.Run("AllDatabases", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
