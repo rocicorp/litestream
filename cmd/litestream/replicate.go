@@ -254,6 +254,13 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	if c.Config.Snapshot.Retention != nil {
 		c.Store.SnapshotRetention = *c.Config.Snapshot.Retention
 	}
+	if c.Config.Snapshot.Mode != "" {
+		mode, err := litestream.ParseSnapshotMode(c.Config.Snapshot.Mode)
+		if err != nil {
+			return err
+		}
+		c.Store.SnapshotMode = mode
+	}
 	if c.Config.L0Retention != nil {
 		c.Store.SetL0Retention(*c.Config.L0Retention)
 	}

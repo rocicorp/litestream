@@ -1,6 +1,7 @@
 package litestream
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -3258,6 +3259,99 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
 	if err != nil {
 		return info, err
+	}
+
+	db.recordMaxLTXFile(SnapshotLevel, info)
+
+	return info, nil
+}
+
+// SnapshotCompact mints a new snapshot by merging the existing remote LTX files
+// that reconstruct the current head (the prior snapshot plus the increments on
+// top of it) instead of reading the live database. It is the compaction-based
+// counterpart to Snapshot (selected by SnapshotModeCompact) and takes no
+// checkpoint lock, so it never stalls checkpoints however large the database.
+//
+// The input set is chosen by CalcRestorePlan, the same planner the restore path
+// uses, so this is "restore the current head, but persist the merged LTX to the
+// snapshot level instead of decoding it to a database file." The plan starts at
+// TXID 1 (normally the latest snapshot, or the base itself on a replica that
+// has none), so the merged output is a valid [1, k] snapshot. The result is
+// TXID-positioned: it carries no live-WAL extent, so its WAL header fields are
+// left zero. Nothing reads them from the snapshot level; the WAL-alignment
+// checks read the local L0 anchor, which this never writes.
+//
+// If no plan reconstructs the head (for example, the replica has no base at
+// TXID 1), it falls back to a live Snapshot.
+func (db *DB) SnapshotCompact(ctx context.Context) (*ltx.FileInfo, error) {
+	if db.Replica == nil {
+		return nil, fmt.Errorf("no replica configured")
+	}
+	client := db.Replica.Client
+
+	// Plan the minimal contiguous set of files that reconstructs the current
+	// head (txID == 0, timestamp zero => newest reconstructable position).
+	infos, err := CalcRestorePlan(ctx, client, 0, time.Time{}, db.Logger)
+	if errors.Is(err, ErrTxNotAvailable) {
+		db.Logger.WarnContext(ctx, "no restore plan for compaction snapshot, falling back to live snapshot")
+		return db.Snapshot(ctx)
+	} else if err != nil {
+		return nil, fmt.Errorf("calc snapshot plan: %w", err)
+	}
+
+	if infos[0].MinTXID != 1 {
+		// Defensive: the planner only starts a plan at TXID 1, and the merged
+		// output must start there to be a valid snapshot.
+		return nil, fmt.Errorf("snapshot plan does not begin at txid 1 (starts at %s)", infos[0].MinTXID)
+	}
+	// Nothing to fold in: the plan is just the existing snapshot, so a new
+	// snapshot would be identical. (A lone base outside the snapshot level is
+	// still merged, which moves it into the snapshot level.)
+	if len(infos) == 1 && infos[0].Level == SnapshotLevel {
+		return nil, ErrNoCompaction
+	}
+	maxTXID := infos[len(infos)-1].MaxTXID
+
+	// Buffer every input, as restore does: the decoder issues several small
+	// reads per page. Small increments get a buffer no larger than themselves.
+	const maxBufSize = 1 << 20
+	rdrs := make([]io.Reader, 0, len(infos))
+	closers := make([]io.Closer, 0, len(infos))
+	defer func() {
+		for _, c := range closers {
+			_ = c.Close()
+		}
+	}()
+	for _, info := range infos {
+		rr := internal.NewResumableReader(ctx, client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, db.Logger)
+		closers = append(closers, rr)
+		rdrs = append(rdrs, bufio.NewReaderSize(rr, int(min(max(info.Size, 4096), maxBufSize))))
+	}
+
+	pr, pw := io.Pipe()
+	compacted := make(chan struct{})
+	go func() {
+		defer close(compacted)
+		comp, err := ltx.NewCompactor(pw, rdrs)
+		if err != nil {
+			_ = pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+			return
+		}
+		// The output page index is database-sized; past the encoder's
+		// threshold it spills into the meta directory rather than memory.
+		// Cleanup covers the error paths that never reach the encoder's Close.
+		defer func() { _ = comp.Cleanup() }()
+		comp.HeaderFlags = ltx.HeaderFlagNoChecksum
+		comp.SetSpillDir(db.MetaPath())
+		comp.SetSpillThreshold(db.spillThreshold)
+		_ = pw.CloseWithError(comp.Compact(ctx))
+	}()
+
+	info, err := client.WriteLTXFile(ctx, SnapshotLevel, 1, maxTXID, pr)
+	_ = pr.CloseWithError(err)
+	<-compacted // wait for the spill cleanup; a failed upload unblocks the writer
+	if err != nil {
+		return info, fmt.Errorf("write snapshot ltx: %w", err)
 	}
 
 	db.recordMaxLTXFile(SnapshotLevel, info)

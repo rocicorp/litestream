@@ -70,6 +70,10 @@
 # snapshot:
 #   interval:  24h                         # How often full snapshots are taken (default: 24h)
 #   retention: 24h                         # How long snapshots are kept (default: 24h)
+#   mode: live                             # live: read the database + WAL (default)
+#                                          # compact: merge the prior snapshot and the
+#                                          # increments on the replica instead, so the
+#                                          # live database is never read or locked
 
 # L0 retention. Controls how long fine-grained L0 (raw) files are kept, which
 # bounds how far back point-in-time restores can land.

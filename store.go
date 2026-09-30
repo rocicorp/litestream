@@ -33,6 +33,13 @@ var (
 	// treats this like ErrNoCompaction and retries on its next interval.
 	ErrCompactionInProgress = errors.New("compaction in progress")
 
+	// ErrSnapshotPending is returned by a compact-mode snapshot when the
+	// database has advanced past the newest snapshot but the replica does not
+	// yet hold the increments to fold in (including the _litestream_seq write
+	// that refreshes an idle database). The monitor retries it after
+	// SnapshotRetryInterval rather than waiting a full snapshot interval.
+	ErrSnapshotPending = errors.New("snapshot pending replication")
+
 	// ErrTxNotAvailable is returned when a transaction does not exist.
 	ErrTxNotAvailable = errors.New("transaction not available")
 
@@ -100,6 +107,56 @@ func (m CompactionSerializeMode) String() string {
 	}
 }
 
+// SnapshotMode selects how periodic snapshots (L9) are produced.
+type SnapshotMode int
+
+const (
+	// SnapshotModeLive reads the current database file + WAL under the checkpoint
+	// read lock and encodes a fresh full-DB image. This is the historical
+	// behavior: it captures a WAL-positioned point-in-time cut, but holds
+	// chkMu.RLock for the whole read, which stalls checkpoints on hot databases.
+	SnapshotModeLive SnapshotMode = iota
+
+	// SnapshotModeCompact mints each snapshot by merging the existing remote LTX
+	// files (the prior snapshot plus the increments on top of it, as chosen by
+	// the restore planner) into a new snapshot. It never reads the live database
+	// and takes no checkpoint lock, at the cost of reading the prior snapshot
+	// back from the replica. The result is TXID-positioned (no live WAL), so the
+	// snapshot's WAL header fields are left zero.
+	//
+	// Because every restore then depends only on files written within roughly
+	// one snapshot interval, this mode also refreshes the snapshot of an idle
+	// database (see Store.CompactDB), so object-age lifecycle policies on the
+	// replica never expire the only snapshot.
+	SnapshotModeCompact
+)
+
+// ParseSnapshotMode parses a mode from its string form ("live", "compact").
+// An empty string returns SnapshotModeLive (the default). Unrecognized values
+// return an error.
+func ParseSnapshotMode(s string) (SnapshotMode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "live":
+		return SnapshotModeLive, nil
+	case "compact", "compaction":
+		return SnapshotModeCompact, nil
+	default:
+		return SnapshotModeLive, fmt.Errorf("invalid snapshot mode %q (want live or compact)", s)
+	}
+}
+
+// String returns the canonical string form of the mode.
+func (m SnapshotMode) String() string {
+	switch m {
+	case SnapshotModeLive:
+		return "live"
+	case SnapshotModeCompact:
+		return "compact"
+	default:
+		return fmt.Sprintf("SnapshotMode(%d)", int(m))
+	}
+}
+
 // DBNotReadyError is returned when an operation is attempted before the
 // database has been initialized (e.g., page size not yet known).
 type DBNotReadyError struct {
@@ -122,6 +179,12 @@ func (e *DBNotReadyError) Is(target error) bool {
 const (
 	DefaultSnapshotInterval  = 24 * time.Hour
 	DefaultSnapshotRetention = 24 * time.Hour
+
+	// DefaultSnapshotRetryInterval is the initial delay before retrying a
+	// failed snapshot. It doubles on each consecutive failure, up to the
+	// snapshot interval, so a transient failure does not leave the newest
+	// snapshot a full interval older than intended.
+	DefaultSnapshotRetryInterval = 1 * time.Minute
 
 	DefaultRetention              = 24 * time.Hour
 	DefaultRetentionCheckInterval = 1 * time.Hour
@@ -161,6 +224,13 @@ type Store struct {
 	SnapshotInterval time.Duration
 	// The duration of time that snapshots are kept before being deleted.
 	SnapshotRetention time.Duration
+	// The initial delay before retrying a failed snapshot (see
+	// DefaultSnapshotRetryInterval).
+	SnapshotRetryInterval time.Duration
+
+	// SnapshotMode selects how periodic snapshots are produced (live db+wal read
+	// vs. compaction of existing remote LTX files). Defaults to SnapshotModeLive.
+	SnapshotMode SnapshotMode
 
 	// The duration that L0 files are kept after being compacted into L1.
 	L0Retention time.Duration
@@ -209,6 +279,8 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 
 		SnapshotInterval:         DefaultSnapshotInterval,
 		SnapshotRetention:        DefaultSnapshotRetention,
+		SnapshotRetryInterval:    DefaultSnapshotRetryInterval,
+		SnapshotMode:             SnapshotModeLive,
 		L0Retention:              DefaultL0Retention,
 		L0RetentionCheckInterval: DefaultL0RetentionCheckInterval,
 		CompactionMonitorEnabled: true,
@@ -634,6 +706,7 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 	s.Logger.Info("starting compaction monitor", "level", lvl.Level, "interval", lvl.Interval)
 
 	retryDeadline := time.Time{}
+	var snapshotRetryDelay time.Duration // zero while the last snapshot tick succeeded
 	timer := time.NewTimer(time.Nanosecond)
 	defer timer.Stop()
 
@@ -649,6 +722,7 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 		nextDelay := time.Until(lvl.NextCompactionAt(now))
 
 		var notReadyDBs []string
+		var snapshotRetry bool
 
 		for _, db := range s.DBs() {
 			if !db.IsOpen() {
@@ -660,11 +734,16 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 				db.Logger.Debug("no compaction", "level", lvl.Level, "path", db.Path())
 			case errors.Is(err, ErrCompactionInProgress):
 				db.Logger.Debug("compaction already in progress for db, skipping", "level", lvl.Level, "path", db.Path())
+				snapshotRetry = true
+			case errors.Is(err, ErrSnapshotPending):
+				db.Logger.Info("snapshot waiting for replication", "path", db.Path())
+				snapshotRetry = true
 			case errors.Is(err, ErrDBNotReady):
 				db.Logger.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
 				notReadyDBs = append(notReadyDBs, db.Path())
 			case err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded):
 				db.Logger.Error("compaction failed", "level", lvl.Level, "error", err)
+				snapshotRetry = true
 			}
 
 			if lvl.Level == SnapshotLevel {
@@ -693,11 +772,44 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			retryDeadline = time.Time{}
 		}
 
+		// A snapshot that failed (or was skipped because another compaction
+		// held the DB) is retried with backoff rather than waiting a full
+		// interval. The retry gets past CompactDB's ErrCompactionTooEarly
+		// gate because the newest snapshot still predates this interval.
+		if lvl.Level == SnapshotLevel {
+			if snapshotRetry {
+				snapshotRetryDelay = nextSnapshotRetryDelay(snapshotRetryDelay, s.SnapshotRetryInterval, lvl.Interval)
+				if snapshotRetryDelay < nextDelay {
+					nextDelay = snapshotRetryDelay
+					s.Logger.Info("scheduling snapshot retry", "delay", snapshotRetryDelay)
+				}
+			} else {
+				snapshotRetryDelay = 0
+			}
+		}
+
 		if nextDelay < 0 {
 			nextDelay = 0
 		}
 		timer.Reset(nextDelay)
 	}
+}
+
+// nextSnapshotRetryDelay returns the delay before the next snapshot retry:
+// initial on the first failure, doubling on each consecutive one, capped at
+// max. A non-positive initial disables the early retry by returning max.
+func nextSnapshotRetryDelay(prev, initial, max time.Duration) time.Duration {
+	if initial <= 0 {
+		return max
+	}
+	next := initial
+	if prev > 0 {
+		next = prev * 2
+	}
+	if max > 0 && next > max {
+		next = max
+	}
+	return next
 }
 
 func (s *Store) monitorL0Retention(ctx context.Context) {
@@ -890,18 +1002,47 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 		// advanced past the base (pos > 1). Standing down at pos <= 1 avoids
 		// a concurrent second full-DB read that would otherwise race the sync
 		// path's base capture.
-		if pos.TXID <= 1 {
+		if dstInfo.MaxTXID == 0 && pos.TXID <= 1 {
 			return nil, ErrNoCompaction
 		}
 		if dstInfo.MaxTXID != 0 && dstInfo.MaxTXID >= pos.TXID {
-			return nil, ErrNoCompaction
+			if s.SnapshotMode != SnapshotModeCompact {
+				return nil, ErrNoCompaction
+			}
+			// The database is idle: nothing has been written since the newest
+			// snapshot, which the ErrCompactionTooEarly gate above shows is at
+			// least an interval old. Compact mode promises that a restore needs
+			// only files younger than about one interval (so object-age
+			// lifecycle policies can clean up the replica), so refresh the
+			// snapshot anyway. Writing a real transaction gives the restore plan
+			// an increment to fold in, so the merge mints [1, k+1] under a new
+			// name instead of overwriting [1, k] in place, which could splice
+			// bytes under a concurrent reader that reopens mid-stream. The
+			// database's own sync picks the write up and the replica uploads
+			// it; the monitor's retry then takes the snapshot.
+			if err := db.bumpLitestreamSeq(ctx); err != nil {
+				return nil, fmt.Errorf("bump seq to refresh idle snapshot: %w", err)
+			}
+			db.Logger.InfoContext(ctx, "refreshing snapshot of idle database", "txid", dstInfo.MaxTXID.String())
+			return nil, ErrSnapshotPending
 		}
 
-		info, err := db.Snapshot(ctx)
+		var info *ltx.FileInfo
+		switch s.SnapshotMode {
+		case SnapshotModeCompact:
+			info, err = db.SnapshotCompact(ctx)
+			if errors.Is(err, ErrNoCompaction) {
+				// The database is past the newest snapshot, but the replica
+				// holds no increments yet: retry once they are uploaded.
+				return nil, ErrSnapshotPending
+			}
+		default:
+			info, err = db.Snapshot(ctx)
+		}
 		if err != nil {
 			return info, err
 		}
-		db.Logger.InfoContext(ctx, "snapshot complete", "txid", info.MaxTXID.String(), "size", info.Size)
+		db.Logger.InfoContext(ctx, "snapshot complete", "mode", s.SnapshotMode.String(), "txid", info.MaxTXID.String(), "size", info.Size)
 		return info, nil
 	}
 
