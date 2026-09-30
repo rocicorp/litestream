@@ -4194,3 +4194,105 @@ dbs:
 		}
 	})
 }
+
+func TestConfig_SnapshotMode(t *testing.T) {
+	t.Run("Global", func(t *testing.T) {
+		config, err := main.ParseConfig(strings.NewReader(`
+snapshot:
+  mode: compact
+`), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if config.Snapshot.Mode != "compact" {
+			t.Fatalf("expected snapshot mode compact, got %q", config.Snapshot.Mode)
+		}
+	})
+
+	t.Run("DefaultEmpty", func(t *testing.T) {
+		config, err := main.ParseConfig(strings.NewReader(`
+dbs:
+  - path: /tmp/test.db
+`), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if config.Snapshot.Mode != "" {
+			t.Fatalf("expected default (empty) snapshot mode, got %q", config.Snapshot.Mode)
+		}
+	})
+
+	t.Run("DBLevelPromoted", func(t *testing.T) {
+		config, err := main.ParseConfig(strings.NewReader(`
+dbs:
+  - path: /tmp/test.db
+    snapshot:
+      mode: compact
+`), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if config.Snapshot.Mode != "compact" {
+			t.Fatalf("expected promoted snapshot mode compact, got %q", config.Snapshot.Mode)
+		}
+	})
+
+	t.Run("GlobalOverridesDBLevel", func(t *testing.T) {
+		config, err := main.ParseConfig(strings.NewReader(`
+snapshot:
+  mode: live
+dbs:
+  - path: /tmp/test.db
+    snapshot:
+      mode: compact
+`), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if config.Snapshot.Mode != "live" {
+			t.Fatalf("expected global snapshot mode live, got %q", config.Snapshot.Mode)
+		}
+	})
+
+	t.Run("DBLevelConflicting", func(t *testing.T) {
+		_, err := main.ParseConfig(strings.NewReader(`
+dbs:
+  - path: /tmp/a.db
+    snapshot:
+      mode: compact
+  - path: /tmp/b.db
+    snapshot:
+      mode: live
+`), false)
+		if err == nil || !strings.Contains(err.Error(), "conflicting database snapshot modes") {
+			t.Fatalf("expected conflicting snapshot mode error, got %v", err)
+		}
+	})
+
+	t.Run("InvalidGlobal", func(t *testing.T) {
+		_, err := main.ParseConfig(strings.NewReader(`
+snapshot:
+  mode: bogus
+`), false)
+		if !errors.Is(err, main.ErrInvalidSnapshotMode) {
+			t.Fatalf("expected ErrInvalidSnapshotMode, got %v", err)
+		}
+	})
+
+	t.Run("InvalidDBLevel", func(t *testing.T) {
+		_, err := main.ParseConfig(strings.NewReader(`
+snapshot:
+  mode: compact
+dbs:
+  - path: /tmp/test.db
+    snapshot:
+      mode: bogus
+`), false)
+		if !errors.Is(err, main.ErrInvalidSnapshotMode) {
+			t.Fatalf("expected ErrInvalidSnapshotMode, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "dbs[/tmp/test.db].snapshot.mode") {
+			t.Fatalf("expected the per-db field in the error, got %v", err)
+		}
+	})
+}

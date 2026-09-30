@@ -53,6 +53,7 @@ var errStop = errors.New("stop")
 var (
 	ErrInvalidSnapshotInterval         = errors.New("snapshot interval must be greater than 0")
 	ErrInvalidSnapshotRetention        = errors.New("snapshot retention must be greater than 0")
+	ErrInvalidSnapshotMode             = errors.New("snapshot mode must be live or compact")
 	ErrInvalidCompactionInterval       = errors.New("compaction interval must be greater than 0")
 	ErrInvalidSyncInterval             = errors.New("sync interval must be greater than 0")
 	ErrInvalidL0Retention              = errors.New("l0 retention must not be negative")
@@ -329,6 +330,11 @@ type Config struct {
 type SnapshotConfig struct {
 	Interval  *time.Duration `yaml:"interval"`
 	Retention *time.Duration `yaml:"retention"`
+	// Mode selects how snapshots are produced: "live" (default) reads the live
+	// database + WAL; "compact" merges the existing remote LTX files instead of
+	// reading the live database (no checkpoint stall, reads the prior snapshot
+	// back from the replica).
+	Mode string `yaml:"mode"`
 }
 
 // RetentionConfig configures retention enforcement behavior.
@@ -359,6 +365,8 @@ func (c *Config) applyDBSnapshotConfig(globalIntervalSet, globalRetentionSet boo
 	var intervalDB string
 	var retention *time.Duration
 	var retentionDB string
+	var mode string
+	var modeDB string
 
 	for _, db := range c.DBs {
 		dbID := db.Path
@@ -379,6 +387,13 @@ func (c *Config) applyDBSnapshotConfig(globalIntervalSet, globalRetentionSet boo
 			retention = db.Snapshot.Retention
 			retentionDB = dbID
 		}
+		if db.Snapshot.Mode != "" {
+			if mode != "" && mode != db.Snapshot.Mode {
+				return fmt.Errorf("conflicting database snapshot modes: %s has %q, %s has %q", modeDB, mode, dbID, db.Snapshot.Mode)
+			}
+			mode = db.Snapshot.Mode
+			modeDB = dbID
+		}
 	}
 
 	if !globalIntervalSet && interval != nil {
@@ -386,6 +401,11 @@ func (c *Config) applyDBSnapshotConfig(globalIntervalSet, globalRetentionSet boo
 	}
 	if !globalRetentionSet && retention != nil {
 		c.Snapshot.Retention = retention
+	}
+	// DefaultConfig leaves the mode empty, so a non-empty global mode was set
+	// explicitly.
+	if c.Snapshot.Mode == "" {
+		c.Snapshot.Mode = mode
 	}
 	return nil
 }
@@ -431,6 +451,13 @@ func (c *Config) Validate() error {
 			Err:   ErrInvalidSnapshotRetention,
 			Field: "snapshot.retention",
 			Value: *c.Snapshot.Retention,
+		}
+	}
+	if _, err := litestream.ParseSnapshotMode(c.Snapshot.Mode); err != nil {
+		return &ConfigValidationError{
+			Err:   ErrInvalidSnapshotMode,
+			Field: "snapshot.mode",
+			Value: c.Snapshot.Mode,
 		}
 	}
 	if c.L0Retention != nil && *c.L0Retention < 0 {
@@ -543,6 +570,13 @@ func (c *Config) Validate() error {
 				Err:   ErrInvalidSnapshotRetention,
 				Field: fmt.Sprintf("dbs[%s].snapshot.retention", dbIdentifier),
 				Value: *db.Snapshot.Retention,
+			}
+		}
+		if _, err := litestream.ParseSnapshotMode(db.Snapshot.Mode); err != nil {
+			return &ConfigValidationError{
+				Err:   ErrInvalidSnapshotMode,
+				Field: fmt.Sprintf("dbs[%s].snapshot.mode", dbIdentifier),
+				Value: db.Snapshot.Mode,
 			}
 		}
 

@@ -5081,4 +5081,81 @@ func TestDB_SnapshotEncodersSpillPageIndex(t *testing.T) {
 			t.Fatalf("snapshot has %d pages, want more than spill threshold %d", n, db.spillThreshold)
 		}
 	})
+
+	t.Run("SnapshotCompact", func(t *testing.T) {
+		db, _ := openSpillTestDB(t, false)
+		syncSnapshotCompactTestDB(t, db)
+
+		client := &spillProbeClient{testReplicaClient: db.Replica.Client.(*testReplicaClient), metaPath: db.MetaPath()}
+		db.Replica.Client = client
+		info, err := db.SnapshotCompact(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !client.sawSpill.Load() {
+			t.Fatal("expected the compaction snapshot's page index to spill")
+		}
+		if files := spillFiles(db.MetaPath()); len(files) != 0 {
+			t.Fatalf("spill files left behind: %v", files)
+		}
+		rc, err := db.Replica.Client.OpenLTXFile(context.Background(), SnapshotLevel, info.MinTXID, info.MaxTXID, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rc.Close()
+		if n := decodeLTXFile(t, rc); n <= db.spillThreshold {
+			t.Fatalf("snapshot has %d pages, want more than spill threshold %d", n, db.spillThreshold)
+		}
+	})
+}
+
+// syncSnapshotCompactTestDB uploads the base to the snapshot level, then
+// writes and uploads one increment on top of it, so SnapshotCompact has a
+// prior snapshot and an increment to merge.
+func syncSnapshotCompactTestDB(t *testing.T, db *DB) {
+	t.Helper()
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (randomblob(3000));`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDB_SnapshotCompact_NoCheckpointLock verifies that a compaction snapshot
+// never touches the live database: it completes while the checkpoint lock is
+// held exclusively, which would block a live Snapshot for its whole duration.
+func TestDB_SnapshotCompact_NoCheckpointLock(t *testing.T) {
+	db, _ := openSpillTestDB(t, false)
+	syncSnapshotCompactTestDB(t, db)
+
+	db.chkMu.Lock()
+	defer db.chkMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	info, err := db.SnapshotCompact(ctx)
+	if err != nil {
+		t.Fatalf("snapshot compact while checkpoint lock held: %v", err)
+	}
+	if info.Level != SnapshotLevel || info.MinTXID != 1 {
+		t.Fatalf("expected a [1, k] snapshot, got level %d [%s, %s]", info.Level, info.MinTXID, info.MaxTXID)
+	}
 }
