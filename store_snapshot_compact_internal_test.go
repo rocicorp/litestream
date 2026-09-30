@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"sync/atomic"
 	"testing"
@@ -134,23 +135,37 @@ func TestStore_CompactDB_SnapshotPendingReplication(t *testing.T) {
 	}
 }
 
-// failingSnapshotClient fails the first N snapshot-level uploads.
+// failingSnapshotClient fails the first N snapshot-level uploads with err.
 type failingSnapshotClient struct {
 	*testReplicaClient
 	failures atomic.Int32
+	err      error
 }
 
 func (c *failingSnapshotClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
 	if level == SnapshotLevel && c.failures.Add(-1) >= 0 {
-		return nil, errors.New("injected snapshot upload failure")
+		return nil, c.err
 	}
 	return c.testReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
 }
 
 // TestStore_MonitorSnapshotLevel_RetriesFailure verifies that a failed
 // snapshot is retried after SnapshotRetryInterval rather than a full snapshot
-// interval later.
+// interval later. That includes a backend timeout, which wraps
+// context.DeadlineExceeded while the monitor's own context is still live.
 func TestStore_MonitorSnapshotLevel_RetriesFailure(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "Error", err: errors.New("injected snapshot upload failure")},
+		{name: "BackendTimeout", err: fmt.Errorf("upload part: %w", context.DeadlineExceeded)},
+	} {
+		t.Run(tt.name, func(t *testing.T) { testMonitorSnapshotLevelRetries(t, tt.err) })
+	}
+}
+
+func testMonitorSnapshotLevelRetries(t *testing.T, failure error) {
 	db, _ := openSpillTestDB(t, false)
 	syncSnapshotCompactTestDB(t, db)
 	pos, err := db.Pos()
@@ -158,7 +173,7 @@ func TestStore_MonitorSnapshotLevel_RetriesFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client := &failingSnapshotClient{testReplicaClient: db.Replica.Client.(*testReplicaClient)}
+	client := &failingSnapshotClient{testReplicaClient: db.Replica.Client.(*testReplicaClient), err: failure}
 	client.failures.Store(2)
 	db.Replica.Client = client
 	backdateSnapshot(t, db)

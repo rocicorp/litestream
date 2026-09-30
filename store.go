@@ -741,14 +741,17 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			case errors.Is(err, ErrDBNotReady):
 				db.Logger.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
 				notReadyDBs = append(notReadyDBs, db.Path())
-			case err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded):
+			case err != nil && ctx.Err() == nil:
+				// Check the monitor's context rather than the error: a backend
+				// timeout can wrap context.DeadlineExceeded while the store is
+				// running, and that is a real failure to log and retry. Only
+				// shutdown is suppressed.
 				db.Logger.Error("compaction failed", "level", lvl.Level, "error", err)
 				snapshotRetry = true
 			}
 
 			if lvl.Level == SnapshotLevel {
-				if err := s.EnforceSnapshotRetention(ctx, db); err != nil &&
-					!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				if err := s.EnforceSnapshotRetention(ctx, db); err != nil && ctx.Err() == nil {
 					db.Logger.Error("retention enforcement failed", "error", err)
 				}
 			}
