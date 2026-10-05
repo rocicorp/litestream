@@ -3786,6 +3786,10 @@ type RestoreOptions struct {
 	// IntegrityCheck specifies the level of integrity checking after restore.
 	// Zero value (IntegrityCheckNone) skips the check for backward compatibility.
 	IntegrityCheck IntegrityCheckMode
+
+	// Fork, if set, also copies the restore plan into an empty replica that
+	// replicate then resumes against without a base snapshot. See RestoreFork.
+	Fork *RestoreFork
 }
 
 // NewRestoreOptions returns a new instance of RestoreOptions with defaults.
