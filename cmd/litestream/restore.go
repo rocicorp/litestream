@@ -39,6 +39,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	fs.BoolVar(&opt.Follow, "f", false, "follow mode")
 	fs.DurationVar(&opt.FollowInterval, "follow-interval", opt.FollowInterval, "polling interval for follow mode")
 	integrityCheck := fs.String("integrity-check", "none", "post-restore integrity check: none, quick, or full")
+	forkURL := fs.String("fork-to-url", "", "fork the backup into this empty replica URL")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -96,6 +97,8 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	if litestream.IsURL(fs.Arg(0)) {
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
+		} else if *forkURL != "" {
+			return fmt.Errorf("-fork-to-url requires restoring a database from the config file")
 		}
 		if r, err = c.loadFromURL(ctx, fs.Arg(0), *ifDBNotExists, &opt); errors.Is(err, errSkipDBExists) {
 			slog.Info("database already exists, skipping")
@@ -107,7 +110,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		if *configPath == "" {
 			*configPath = DefaultConfigPath()
 		}
-		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, *ifDBNotExists, &opt); errors.Is(err, errSkipDBExists) {
+		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, *ifDBNotExists, *forkURL, &opt); errors.Is(err, errSkipDBExists) {
 			slog.Info("database already exists, skipping")
 			return nil
 		} else if err != nil {
@@ -116,6 +119,9 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	if *dryRun {
+		if opt.Fork != nil {
+			return fmt.Errorf("cannot use -dry-run with -fork-to-url")
+		}
 		plan, err := c.dryRunPlan(ctx, fs.Arg(0), r, opt)
 		if errors.Is(err, litestream.ErrTxNotAvailable) {
 			return fmt.Errorf("no matching backup files available")
@@ -152,13 +158,20 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		return err
 	}
 	if *jsonOutput {
-		output, err := json.MarshalIndent(RestoreResult{
+		result := RestoreResult{
 			DBPath:         opt.OutputPath,
 			Replica:        r.Client.Type(),
 			TXID:           txid,
 			DurationMS:     time.Since(start).Milliseconds(),
 			IntegrityCheck: *integrityCheck,
-		}, "", "  ")
+		}
+		if opt.Fork != nil {
+			result.Fork = &RestoreForkResult{Forked: opt.Fork.Forked}
+			if opt.Fork.Forked {
+				result.Fork.TXID = opt.Fork.TXID.String()
+			}
+		}
+		output, err := json.MarshalIndent(result, "", "  ")
 		if err != nil {
 			return fmt.Errorf("failed to format response: %w", err)
 		}
@@ -191,6 +204,16 @@ type RestoreResult struct {
 	TXID           string `json:"txid"`
 	DurationMS     int64  `json:"duration_ms"`
 	IntegrityCheck string `json:"integrity_check"`
+
+	// Fork is set when -fork-to-url was given.
+	Fork *RestoreForkResult `json:"fork,omitempty"`
+}
+
+// RestoreForkResult reports whether a restore forked into the -fork-to-url
+// replica. A restore plan that cannot fork is restored without forking.
+type RestoreForkResult struct {
+	Forked bool   `json:"forked"`
+	TXID   string `json:"txid,omitempty"`
 }
 
 func (c *RestoreCommand) dryRunPlan(ctx context.Context, source string, r *litestream.Replica, opt litestream.RestoreOptions) (RestorePlan, error) {
@@ -325,7 +348,7 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 }
 
 // loadFromConfig returns a replica & updates the restore options from a DB reference.
-func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath string, expandEnv, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
+func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath string, expandEnv, ifDBNotExists bool, forkURL string, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
 	// Load configuration.
 	config, err := ReadConfigFile(configPath, expandEnv)
 	if err != nil {
@@ -355,7 +378,30 @@ func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath st
 		return nil, errSkipDBExists
 	}
 
+	if forkURL != "" {
+		if opt.Fork, err = newRestoreFork(dbConfig, db, forkURL); err != nil {
+			return nil, err
+		}
+	}
+
 	return db.Replica, nil
+}
+
+// newRestoreFork returns the fork for a restore of db, whose replica is
+// configured like db's own replica but at forkURL.
+func newRestoreFork(dbConfig *DBConfig, db *litestream.DB, forkURL string) (*litestream.RestoreFork, error) {
+	rc := dbConfig.Replica
+	if rc == nil {
+		rc = dbConfig.Replicas[0]
+	}
+	forkConfig := *rc
+	forkConfig.URL, forkConfig.Path = forkURL, ""
+
+	r, err := NewReplicaFromConfig(&forkConfig, db)
+	if err != nil {
+		return nil, fmt.Errorf("fork replica: %w", err)
+	}
+	return &litestream.RestoreFork{Client: r.Client}, nil
 }
 
 // Usage prints the help screen to STDOUT.
@@ -423,6 +469,16 @@ Arguments:
 	    Run a post-restore integrity check on the database.
 	    MODE is one of: none, quick, full.
 	    Defaults to none.
+
+	-fork-to-url URL
+	    Fork the backup into the empty replica at URL, configured like the
+	    database's replica: the files used for this restore are copied there,
+	    laid out so that replicate can continue it, and local state is left
+	    from which replicate resumes against it without a base snapshot. The
+	    fork shares the backup's history up to the restored TXID only.
+	    Requires restoring a database from the config file to its latest
+	    TXID. A plan that cannot fork is restored without forking; with
+	    -json, the "fork" field reports which happened.
 
 
 Examples:

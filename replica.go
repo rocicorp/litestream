@@ -787,6 +787,21 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
 
+	var fork *restoreForker
+	if opt.Fork != nil {
+		opt.Fork.Forked, opt.Fork.TXID = false, 0
+		if fork, err = r.prepareFork(restoreCtx, opt, infos); err != nil {
+			return err
+		}
+		if fork != nil {
+			defer func() {
+				if err != nil {
+					fork.abort(fmt.Errorf("restore failed: %w", err))
+				}
+			}()
+		}
+	}
+
 	// Every stream boundary below is buffered. The LTX decoder issues several
 	// small reads per page (page header, size prefix, compressed block);
 	// unbuffered, each is a syscall or a mutex round trip into the storage
@@ -804,7 +819,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 	defer closeReaders()
 
-	for _, info := range infos {
+	for i, info := range infos {
 		// Validate file size - must be at least header size to be readable
 		if info.Size < ltx.HeaderSize {
 			return fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
@@ -815,7 +830,14 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 		rr := internal.NewResumableReader(restoreCtx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger())
 		closers = append(closers, rr)
-		rdrs = append(rdrs, bufio.NewReaderSize(rr, restoreBufSize))
+		// The tee sits under the buffer, where the resumable reader has
+		// already hidden retries behind one continuous stream, so it sees
+		// each byte of the file exactly once.
+		var rd io.Reader = rr
+		if fork != nil {
+			rd = fork.tee(i, rr)
+		}
+		rdrs = append(rdrs, bufio.NewReaderSize(rd, restoreBufSize))
 	}
 
 	if len(rdrs) == 0 {
@@ -857,6 +879,18 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	if err := applyRestoreDeltas(f, snapshot.Header(), rdrs[1:]); err != nil {
 		return fmt.Errorf("apply ltx files: %w", err)
 	}
+	if fork != nil {
+		// The decoders read each file to its end; reading on to EOF
+		// completes each copy regardless.
+		for _, rd := range rdrs {
+			if _, err := io.Copy(io.Discard, rd); err != nil {
+				return fmt.Errorf("fork: drain ltx file: %w", err)
+			}
+		}
+		if err := fork.wait(); err != nil {
+			return fmt.Errorf("fork: %w", err)
+		}
+	}
 
 	if err := f.Sync(); err != nil {
 		return err
@@ -883,6 +917,15 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 			return fmt.Errorf("post-restore integrity check: %w", err)
 		}
 		r.Logger().Info("post-restore integrity check passed")
+	}
+
+	if fork != nil {
+		txID, err := fork.finish(ctx, r.DB())
+		if err != nil {
+			return fmt.Errorf("fork: %w", err)
+		}
+		opt.Fork.Forked, opt.Fork.TXID = true, txID
+		r.Logger().Info("forked replica", "txid", txID.String(), "files", len(infos))
 	}
 
 	// Enter follow mode if enabled, continuously applying new LTX files.
