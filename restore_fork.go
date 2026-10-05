@@ -161,6 +161,7 @@ func (s *restoreForker) finish(ctx context.Context, db *DB) (ltx.TXID, error) {
 	if err != nil {
 		return 0, err
 	}
+	defer db.invalidatePosCache() // the local L0 directory is replaced
 	anchorPath, err := seedLocalState(ctx, db.Path(), db.LTXLevelDir(0), dirInfo, txID)
 	if err != nil {
 		return 0, err

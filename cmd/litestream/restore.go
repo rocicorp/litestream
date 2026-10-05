@@ -395,7 +395,11 @@ func newRestoreFork(dbConfig *DBConfig, db *litestream.DB, forkURL string) (*lit
 		rc = dbConfig.Replicas[0]
 	}
 	forkConfig := *rc
-	forkConfig.URL, forkConfig.Path = forkURL, ""
+	forkConfig.URL = forkURL
+	forkConfig.Path = ""
+	forkConfig.Bucket = ""
+	forkConfig.Host = ""
+	forkConfig.WebDAVURL = ""
 
 	r, err := NewReplicaFromConfig(&forkConfig, db)
 	if err != nil {
