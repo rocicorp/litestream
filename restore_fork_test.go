@@ -1,6 +1,7 @@
 package litestream_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -105,6 +106,31 @@ func (n *forkNode) compact(level int) {
 	}
 	_, err := n.store.CompactDB(n.t.Context(), n.db, lvl)
 	require.NoError(n.t, err, "compact L%d", level)
+}
+
+// lateSnapshot takes an L9 snapshot that only lands after between has run,
+// as when a long snapshot upload overlaps other compactions.
+func (n *forkNode) lateSnapshot(between func()) {
+	n.t.Helper()
+	ctx := n.t.Context()
+	client := n.db.Replica.Client
+
+	n.compact(litestream.SnapshotLevel)
+	snap, err := n.db.Replica.MaxLTXFileInfo(ctx, litestream.SnapshotLevel)
+	require.NoError(n.t, err)
+	rc, err := client.OpenLTXFile(ctx, snap.Level, snap.MinTXID, snap.MaxTXID, 0, 0)
+	require.NoError(n.t, err)
+	data, err := io.ReadAll(rc)
+	require.NoError(n.t, err)
+	require.NoError(n.t, rc.Close())
+	require.NoError(n.t, client.DeleteLTXFiles(ctx, []*ltx.FileInfo{&snap}))
+	n.db.ForgetMaxLTXFileInfo(litestream.SnapshotLevel)
+
+	between()
+
+	_, err = client.WriteLTXFile(ctx, snap.Level, snap.MinTXID, snap.MaxTXID, bytes.NewReader(data))
+	require.NoError(n.t, err)
+	n.db.ForgetMaxLTXFileInfo(litestream.SnapshotLevel)
 }
 
 func openStore(t *testing.T, db *litestream.DB, snapshotInterval time.Duration) (*litestream.Store, litestream.CompactionLevels) {
@@ -270,6 +296,30 @@ func TestForkedRestore(t *testing.T) {
 				n.compact(2)
 			},
 			headLevel: 2,
+		},
+		{
+			// L1 [6,9] is compacted while the snapshot [1,7] is still
+			// uploading, so it straddles the snapshot and L2 carries it up.
+			// Plan: L9 [1,7], L2 [6,9] (overlapping the snapshot), L0 [10,10].
+			name: "SnapshotStraddler",
+			build: func(n *forkNode) {
+				n.writeRows(4)
+				n.compact(1)
+				n.compact(2)
+				n.writeRows(2)
+				n.lateSnapshot(func() {
+					n.writeRows(2)
+					n.compact(1)
+				})
+				n.compact(2)
+				n.writeRows(1)
+
+				plan, err := litestream.CalcRestorePlan(n.t.Context(), n.db.Replica.Client, 0, time.Time{}, slog.Default())
+				require.NoError(n.t, err)
+				require.Greater(n.t, len(plan), 1)
+				require.LessOrEqual(n.t, plan[1].MinTXID, plan[0].MaxTXID, "plan must overlap the snapshot")
+			},
+			headLevel: 0,
 		},
 		{
 			// Plan: L9 [1,5] only; the anchor is also uploaded to B's L0.
@@ -472,7 +522,12 @@ func TestCheckForkPlan(t *testing.T) {
 		{"SameLevelRun", []*ltx.FileInfo{snap, file(1, 5, 8), file(1, 9, 12)}, true},
 		{"Empty", nil, false},
 		{"NoSnapshot", []*ltx.FileInfo{file(3, 1, 8)}, false},
-		{"Overlap", []*ltx.FileInfo{snap, file(2, 3, 8)}, false},
+		{"OverlapsSnapshot", []*ltx.FileInfo{snap, file(2, 3, 8)}, true},
+		{"OverlapsSnapshotThenLower", []*ltx.FileInfo{snap, file(3, 3, 8), file(2, 9, 12), file(0, 13, 13)}, true},
+		{"OverlapAfterSnapshot", []*ltx.FileInfo{snap, file(2, 5, 10), file(1, 8, 12)}, false},
+		{"OverlapFromTXID1", []*ltx.FileInfo{snap, file(2, 1, 8)}, false},
+		{"WithinSnapshot", []*ltx.FileInfo{snap, file(2, 3, 4)}, false},
+		{"GapAfterSnapshot", []*ltx.FileInfo{snap, file(2, 6, 8)}, false},
 		{"LevelIncreases", []*ltx.FileInfo{snap, file(1, 5, 8), file(2, 9, 12)}, false},
 		{"SecondSnapshot", []*ltx.FileInfo{snap, file(litestream.SnapshotLevel, 5, 8)}, false},
 	} {

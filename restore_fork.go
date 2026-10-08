@@ -211,13 +211,23 @@ func (t *forkTee) Read(p []byte) (int, error) {
 // be copied to the fork replica at its own level, followed by the anchor
 // [h+1, h+1] in L0.
 //
-// Compaction into each level seeks from max(level max, L9 max)+1 and reads
-// the level below from there. For the copied levels to compact without gaps,
-// the plan must start with a snapshot, have no overlapping files, and never
-// return to a higher level once it has left it: each level then holds one
-// contiguous run of plan files, which ends before the runs of every lower
-// level, and the anchor follows the last of them. In particular, no file of
-// the plan contains h+1, so the anchor overlaps nothing.
+// Compaction into each level reads the level below from that level's max+1,
+// keeping only files that extend past the latest snapshot. For the copied
+// levels to compact without gaps, the plan must start with a snapshot, be
+// contiguous after its first file, and never return to a higher level once it
+// has left it: each level then holds one contiguous run of plan files, which
+// ends before the runs of every lower level, and the anchor follows the last
+// of them. In particular, no file of the plan contains h+1, so the anchor
+// overlaps nothing.
+//
+// The first file after the snapshot may overlap it: compaction that
+// straddled the snapshot before it landed produces such a file, and restore
+// applies it correctly. The levels above it in B start out empty, and
+// compaction into them either carries it up or skips it entirely, so it never
+// leaves a gap inside a level.
+// An overlap between two non-snapshot files is different: compaction into the
+// earlier file's level would skip the later one, leaving a gap that stalls
+// compaction of the levels above.
 func checkForkPlan(infos []*ltx.FileInfo) error {
 	if len(infos) == 0 {
 		return fmt.Errorf("%w: empty restore plan", ErrForkIneligible)
@@ -232,6 +242,9 @@ func checkForkPlan(infos []*ltx.FileInfo) error {
 		switch {
 		case info.Level == SnapshotLevel:
 			return fmt.Errorf("%w: second snapshot %s in plan", ErrForkIneligible, name)
+		case i == 1 && info.MinTXID <= prev.MaxTXID+1 && info.MinTXID > 1 && info.MaxTXID > prev.MaxTXID:
+			// Extends the snapshot, possibly overlapping it. A [1,k] name
+			// would read as a snapshot, so it is not accepted below a snapshot.
 		case info.MinTXID != prev.MaxTXID+1:
 			return fmt.Errorf("%w: L%d %s does not start right after %s",
 				ErrForkIneligible, info.Level, name, prev.MaxTXID)
