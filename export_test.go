@@ -1,7 +1,10 @@
 package litestream
 
 // Unexported helpers exposed to the external litestream_test package.
-var CheckForkPlan = checkForkPlan
+var (
+	CheckForkPlan = checkForkPlan
+	ForkTargets   = forkTargets
+)
 
 // ForgetMaxLTXFileInfo drops the cached max file info for level, so the next
 // lookup lists the replica.

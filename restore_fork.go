@@ -17,7 +17,8 @@ import (
 // a fork of A's backup: it inherits A's history up to the restored TXID h,
 // and the two timelines only diverge after h. Copying whole files is pure I/O
 // because an LTX file's checksums and page index cover only bytes inside the
-// file. Each file keeps its level (see checkForkPlan).
+// file. The files are laid out in B as one chain in one level, with
+// overlapping files renamed (see forkTargets).
 //
 // The restore then seeds local state for an empty transaction h+1 and
 // uploads it as B's level-0 head [h+1, h+1], from which an unmodified
@@ -49,11 +50,11 @@ type RestoreFork struct {
 // restoreForker copies restore-plan files into the fork replica as the
 // restore reads them.
 type restoreForker struct {
-	client ReplicaClient
-	infos  []*ltx.FileInfo
-	pws    []*io.PipeWriter
-	cancel context.CancelFunc
-	g      *errgroup.Group
+	client  ReplicaClient
+	targets []ltx.FileInfo // where each plan file is copied (see forkTargets)
+	pws     []*io.PipeWriter
+	cancel  context.CancelFunc
+	g       *errgroup.Group
 }
 
 // prepareFork returns a forker for infos, or nil when the plan cannot fork the
@@ -84,19 +85,22 @@ func (r *Replica) prepareFork(ctx context.Context, opt RestoreOptions, infos []*
 	ctx, cancel := context.WithCancel(ctx)
 	g, ctx := errgroup.WithContext(ctx)
 	s := &restoreForker{
-		client: opt.Fork.Client,
-		infos:  infos,
-		pws:    make([]*io.PipeWriter, len(infos)),
-		cancel: cancel,
-		g:      g,
+		client:  opt.Fork.Client,
+		targets: forkTargets(infos),
+		pws:     make([]*io.PipeWriter, len(infos)),
+		cancel:  cancel,
+		g:       g,
 	}
-	for i, info := range infos {
+	for i, target := range s.targets {
 		pr, pw := io.Pipe()
 		s.pws[i] = pw
 		g.Go(func() error {
-			_, err := s.client.WriteLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, pr)
+			_, err := s.client.WriteLTXFile(ctx, target.Level, target.MinTXID, target.MaxTXID, pr)
 			if err != nil {
-				err = fmt.Errorf("copy L%d %s: %w", info.Level, ltx.FormatFilename(info.MinTXID, info.MaxTXID), err)
+				info := infos[i]
+				err = fmt.Errorf("copy L%d %s to L%d %s: %w",
+					info.Level, ltx.FormatFilename(info.MinTXID, info.MaxTXID),
+					target.Level, ltx.FormatFilename(target.MinTXID, target.MaxTXID), err)
 			}
 			_ = pr.CloseWithError(err)
 			return err
@@ -155,7 +159,7 @@ func (s *restoreForker) wait() error {
 // B's L0 must reach the anchor; it is uploaded only after every plan file has
 // been copied, so that B never holds it without the history before it.
 func (s *restoreForker) finish(ctx context.Context, db *DB) (ltx.TXID, error) {
-	txID := s.infos[len(s.infos)-1].MaxTXID + 1
+	txID := s.targets[len(s.targets)-1].MaxTXID + 1
 
 	dirInfo, err := os.Stat(filepath.Dir(db.Path()))
 	if err != nil {
@@ -207,27 +211,11 @@ func (t *forkTee) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// checkForkPlan returns ErrForkIneligible unless every restore-plan file can
-// be copied to the fork replica at its own level, followed by the anchor
-// [h+1, h+1] in L0.
-//
-// Compaction into each level reads the level below from that level's max+1,
-// keeping only files that extend past the latest snapshot. For the copied
-// levels to compact without gaps, the plan must start with a snapshot, be
-// contiguous after its first file, and never return to a higher level once it
-// has left it: each level then holds one contiguous run of plan files, which
-// ends before the runs of every lower level, and the anchor follows the last
-// of them. In particular, no file of the plan contains h+1, so the anchor
-// overlaps nothing.
-//
-// The first file after the snapshot may overlap it: compaction that
-// straddled the snapshot before it landed produces such a file, and restore
-// applies it correctly. The levels above it in B start out empty, and
-// compaction into them either carries it up or skips it entirely, so it never
-// leaves a gap inside a level.
-// An overlap between two non-snapshot files is different: compaction into the
-// earlier file's level would skip the later one, leaving a gap that stalls
-// compaction of the levels above.
+// checkForkPlan returns ErrForkIneligible unless infos is a restorable
+// chain that starts with a snapshot: an L9 file [1,s] followed by files that
+// each start no later than right after their predecessor and end past it.
+// Any such plan can fork, because forkTargets lays it out in a shape that
+// compaction accepts.
 func checkForkPlan(infos []*ltx.FileInfo) error {
 	if len(infos) == 0 {
 		return fmt.Errorf("%w: empty restore plan", ErrForkIneligible)
@@ -242,16 +230,59 @@ func checkForkPlan(infos []*ltx.FileInfo) error {
 		switch {
 		case info.Level == SnapshotLevel:
 			return fmt.Errorf("%w: second snapshot %s in plan", ErrForkIneligible, name)
-		case i == 1 && info.MinTXID <= prev.MaxTXID+1 && info.MinTXID > 1 && info.MaxTXID > prev.MaxTXID:
-			// Extends the snapshot, possibly overlapping it. A [1,k] name
-			// would read as a snapshot, so it is not accepted below a snapshot.
-		case info.MinTXID != prev.MaxTXID+1:
-			return fmt.Errorf("%w: L%d %s does not start right after %s",
+		case info.MinTXID > prev.MaxTXID+1:
+			return fmt.Errorf("%w: L%d %s leaves a gap after %s",
 				ErrForkIneligible, info.Level, name, prev.MaxTXID)
-		case i > 1 && info.Level > prev.Level:
-			return fmt.Errorf("%w: L%d %s follows L%d",
-				ErrForkIneligible, info.Level, name, prev.Level)
+		case info.MaxTXID <= prev.MaxTXID:
+			return fmt.Errorf("%w: L%d %s does not extend past %s",
+				ErrForkIneligible, info.Level, name, prev.MaxTXID)
 		}
 	}
 	return nil
+}
+
+// forkTargets returns the level and TXID range under which each file of a
+// plan accepted by checkForkPlan is copied into the fork replica.
+//
+// Restore accepts a chain whose files come from any levels and may overlap,
+// but compaction reads each level from the max+1 of the level above it, skips
+// files that start before that point, and rejects inputs with a gap. Copied at
+// their own levels, the files of one chain can leave a gap inside several
+// levels. Instead:
+//
+//   - The snapshot keeps its level and name.
+//   - Every other file goes to level M, the highest level among them (L0 if
+//     they are all in L0), so that M holds the whole chain.
+//   - A file that overlaps its predecessor is renamed to start right after it.
+//     Restore applies it to the same result: on top of the predecessor's
+//     state, the pages it changed before that point already hold the values
+//     it carries.
+//
+// M then holds exactly [s+1, h] with no gap or overlap, every other ladder
+// level starts empty, and the anchor [h+1, h+1] follows in L0. Every level
+// boundary is at s+1 or h+1, where compaction starts reading, so no file is
+// ever skipped.
+//
+// Renamed files are copied byte for byte, so their headers keep the original,
+// wider TXID range. Nothing compares a header with its file name: restore and
+// ltx.Compactor only check that each header's range is contiguous with what
+// came before, which a wider range always is, and the pre-apply checksum,
+// which no longer matches, is never verified. A check that a header matches
+// its name would reject these files.
+func forkTargets(infos []*ltx.FileInfo) []ltx.FileInfo {
+	var level int
+	for _, info := range infos[1:] {
+		level = max(level, info.Level)
+	}
+
+	targets := make([]ltx.FileInfo, len(infos))
+	targets[0] = ltx.FileInfo{Level: infos[0].Level, MinTXID: infos[0].MinTXID, MaxTXID: infos[0].MaxTXID}
+	for i := 1; i < len(infos); i++ {
+		targets[i] = ltx.FileInfo{
+			Level:   level,
+			MinTXID: max(infos[i].MinTXID, infos[i-1].MaxTXID+1),
+			MaxTXID: infos[i].MaxTXID,
+		}
+	}
+	return targets
 }
