@@ -17,8 +17,8 @@ import (
 // a fork of A's backup: it inherits A's history up to the restored TXID h,
 // and the two timelines only diverge after h. Copying whole files is pure I/O
 // because an LTX file's checksums and page index cover only bytes inside the
-// file. The files are laid out in B as one chain in one level, with
-// overlapping files renamed (see forkTargets).
+// file. The files are laid out in B as one chain whose levels never increase,
+// with overlapping files renamed (see forkTargets).
 //
 // The restore then seeds local state for an empty transaction h+1 and
 // uploads it as B's level-0 head [h+1, h+1], from which an unmodified
@@ -251,17 +251,22 @@ func checkForkPlan(infos []*ltx.FileInfo) error {
 // levels. Instead:
 //
 //   - The snapshot keeps its level and name.
-//   - Every other file goes to level M, the highest level among them (L0 if
-//     they are all in L0), so that M holds the whole chain.
+//   - Every other file goes to the highest level among itself and the files
+//     after it, so that levels never increase along the chain. Only files
+//     before a higher-level file move up: typically just the file that
+//     straddles the snapshot.
 //   - A file that overlaps its predecessor is renamed to start right after it.
 //     Restore applies it to the same result: on top of the predecessor's
 //     state, the pages it changed before that point already hold the values
 //     it carries.
 //
-// M then holds exactly [s+1, h] with no gap or overlap, every other ladder
-// level starts empty, and the anchor [h+1, h+1] follows in L0. Every level
-// boundary is at s+1 or h+1, where compaction starts reading, so no file is
-// ever skipped.
+// The chain after the snapshot is then exactly [s+1, h], and each level holds
+// one run of it with no gap or overlap, ending right where the runs of the
+// lower levels begin. The anchor [h+1, h+1] follows in L0. Every level
+// boundary is at s+1, at the end of a run, or at h+1, which is where
+// compaction starts reading, so no file is ever skipped. Files keep their
+// original levels where they can, so B goes on compacting the chain's tail as
+// A would have.
 //
 // Renamed files are copied byte for byte, so their headers keep the original,
 // wider TXID range. Nothing compares a header with its file name: restore and
@@ -270,14 +275,11 @@ func checkForkPlan(infos []*ltx.FileInfo) error {
 // which no longer matches, is never verified. A check that a header matches
 // its name would reject these files.
 func forkTargets(infos []*ltx.FileInfo) []ltx.FileInfo {
-	var level int
-	for _, info := range infos[1:] {
-		level = max(level, info.Level)
-	}
-
 	targets := make([]ltx.FileInfo, len(infos))
 	targets[0] = ltx.FileInfo{Level: infos[0].Level, MinTXID: infos[0].MinTXID, MaxTXID: infos[0].MaxTXID}
-	for i := 1; i < len(infos); i++ {
+	var level int
+	for i := len(infos) - 1; i >= 1; i-- {
+		level = max(level, infos[i].Level)
 		targets[i] = ltx.FileInfo{
 			Level:   level,
 			MinTXID: max(infos[i].MinTXID, infos[i-1].MaxTXID+1),
