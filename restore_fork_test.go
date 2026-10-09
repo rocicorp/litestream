@@ -284,8 +284,8 @@ func TestForkedRestore(t *testing.T) {
 		headLevel int
 	}{
 		{
-			// Plan: L9 [1,1], L2 [2,5], L1 [6,8], L0 [9,9], [10,10], all of
-			// which B holds in L2.
+			// Plan: L9 [1,1], L2 [2,5], L1 [6,8], L0 [9,9], [10,10], which B
+			// holds at the same levels.
 			name: "HeadL0",
 			build: func(n *forkNode) {
 				n.writeRows(4)
@@ -339,7 +339,7 @@ func TestForkedRestore(t *testing.T) {
 			// The shape the compactor left before it carried straddlers up:
 			// L2 [6,9] straddles the snapshot [1,7] and L3 skipped it.
 			// Plan: L9 [1,7], L2 [6,9], L3 [10,12], L2 [13,14], L0 [15,15];
-			// B holds L3 [8,9], [10,12], [13,14], [15,15].
+			// B holds L3 [8,9], [10,12], L2 [13,14], L0 [15,15].
 			name: "OldCompactorShape",
 			build: func(n *forkNode) {
 				n.writeRows(4)
@@ -621,29 +621,40 @@ func TestForkTargets(t *testing.T) {
 	}{
 		{"SnapshotOnly", []*ltx.FileInfo{snap}, []ltx.FileInfo{snapTarget}},
 		{
-			// L0 files stay in L0 when nothing higher is in the plan.
 			"L0Only",
 			[]*ltx.FileInfo{snap, file(0, 5, 5), file(0, 6, 6)},
 			[]ltx.FileInfo{snapTarget, target(0, 5, 5), target(0, 6, 6)},
 		},
 		{
-			// Every file moves to the plan's highest level.
-			"Flattened",
+			// Levels that already descend are kept.
+			"DescendingLevels",
 			[]*ltx.FileInfo{snap, file(2, 5, 8), file(1, 9, 10), file(0, 11, 11)},
-			[]ltx.FileInfo{snapTarget, target(2, 5, 8), target(2, 9, 10), target(2, 11, 11)},
+			[]ltx.FileInfo{snapTarget, target(2, 5, 8), target(1, 9, 10), target(0, 11, 11)},
 		},
 		{
-			// The second production shape: the straddler is renamed to start
-			// right after the snapshot, and the chain lands in L3.
+			// The first production shape: the L1 straddler is renamed and moves
+			// up to L2; the tail keeps its levels.
+			"L1StraddlerThenL2",
+			[]*ltx.FileInfo{snap, file(1, 3, 6), file(2, 7, 10), file(1, 11, 12), file(0, 13, 13)},
+			[]ltx.FileInfo{snapTarget, target(2, 5, 6), target(2, 7, 10), target(1, 11, 12), target(0, 13, 13)},
+		},
+		{
+			// The second production shape: the L2 straddler moves up to L3.
 			"L2StraddlerThenL3",
 			[]*ltx.FileInfo{snap, file(2, 3, 6), file(3, 7, 10), file(2, 11, 12), file(0, 13, 13)},
-			[]ltx.FileInfo{snapTarget, target(3, 5, 6), target(3, 7, 10), target(3, 11, 12), target(3, 13, 13)},
+			[]ltx.FileInfo{snapTarget, target(3, 5, 6), target(3, 7, 10), target(2, 11, 12), target(0, 13, 13)},
+		},
+		{
+			// Every file before a higher-level file moves up to it.
+			"LowerBeforeHigher",
+			[]*ltx.FileInfo{snap, file(0, 5, 5), file(1, 6, 7), file(3, 8, 9), file(1, 10, 11)},
+			[]ltx.FileInfo{snapTarget, target(3, 5, 5), target(3, 6, 7), target(3, 8, 9), target(1, 10, 11)},
 		},
 		{
 			// An overlap between two non-snapshot files is trimmed too.
 			"OverlapAfterSnapshot",
 			[]*ltx.FileInfo{snap, file(2, 5, 10), file(1, 8, 12)},
-			[]ltx.FileInfo{snapTarget, target(2, 5, 10), target(2, 11, 12)},
+			[]ltx.FileInfo{snapTarget, target(2, 5, 10), target(1, 11, 12)},
 		},
 		{
 			// A [1,k] file below the snapshot no longer reads as a snapshot.
@@ -657,13 +668,14 @@ func TestForkTargets(t *testing.T) {
 			got := litestream.ForkTargets(tc.plan)
 			require.Equal(t, tc.want, got)
 
-			// The chain after the snapshot is exactly contiguous in one level.
-			for i := 2; i < len(got); i++ {
-				require.Equal(t, got[i-1].Level, got[i].Level, "target %d", i)
+			// The chain after the snapshot is exactly contiguous, its levels
+			// never increase, and no file moves down.
+			for i := 1; i < len(got); i++ {
 				require.Equal(t, got[i-1].MaxTXID+1, got[i].MinTXID, "target %d", i)
-			}
-			if len(got) > 1 {
-				require.Equal(t, got[0].MaxTXID+1, got[1].MinTXID)
+				require.GreaterOrEqual(t, got[i].Level, tc.plan[i].Level, "target %d", i)
+				if i > 1 {
+					require.LessOrEqual(t, got[i].Level, got[i-1].Level, "target %d", i)
+				}
 			}
 		})
 	}
