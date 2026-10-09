@@ -108,6 +108,19 @@ func (n *forkNode) compact(level int) {
 	require.NoError(n.t, err, "compact L%d", level)
 }
 
+// copyLTX copies the replica's file [minTXID,maxTXID] at level into toLevel.
+func (n *forkNode) copyLTX(level int, minTXID, maxTXID ltx.TXID, toLevel int) {
+	n.t.Helper()
+	ctx := n.t.Context()
+	client := n.db.Replica.Client
+	rc, err := client.OpenLTXFile(ctx, level, minTXID, maxTXID, 0, 0)
+	require.NoError(n.t, err)
+	defer func() { _ = rc.Close() }()
+	_, err = client.WriteLTXFile(ctx, toLevel, minTXID, maxTXID, rc)
+	require.NoError(n.t, err)
+	n.db.ForgetMaxLTXFileInfo(toLevel)
+}
+
 // lateSnapshot takes an L9 snapshot that only lands after between has run,
 // as when a long snapshot upload overlaps other compactions.
 func (n *forkNode) lateSnapshot(between func()) {
@@ -186,11 +199,11 @@ func forkFrom(t *testing.T, clientA litestream.ReplicaClient, wantHeadLevel int)
 	h := head.MaxTXID
 	require.Equal(t, h+1, fork.TXID)
 
-	// Every plan file is in B at its own level, followed by the empty
+	// Every plan file is in B at its target, followed by the empty
 	// transaction [h+1,h+1] in L0, which is also the local anchor.
-	for _, info := range plan {
-		_, err := clientB.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
-		require.NoError(t, err, "L%d %s", info.Level, ltx.FormatFilename(info.MinTXID, info.MaxTXID))
+	for _, target := range litestream.ForkTargets(plan) {
+		_, err := clientB.OpenLTXFile(ctx, target.Level, target.MinTXID, target.MaxTXID, 0, 0)
+		require.NoError(t, err, "L%d %s", target.Level, ltx.FormatFilename(target.MinTXID, target.MaxTXID))
 	}
 	max, err := litestream.NewReplicaWithClient(nil, clientB).MaxLTXFileInfo(ctx, 0)
 	require.NoError(t, err)
@@ -271,7 +284,8 @@ func TestForkedRestore(t *testing.T) {
 		headLevel int
 	}{
 		{
-			// Plan: L9 [1,1], L2 [2,5], L1 [6,8], L0 [9,9], [10,10].
+			// Plan: L9 [1,1], L2 [2,5], L1 [6,8], L0 [9,9], [10,10], all of
+			// which B holds in L2.
 			name: "HeadL0",
 			build: func(n *forkNode) {
 				n.writeRows(4)
@@ -318,6 +332,48 @@ func TestForkedRestore(t *testing.T) {
 				require.NoError(n.t, err)
 				require.Greater(n.t, len(plan), 1)
 				require.LessOrEqual(n.t, plan[1].MinTXID, plan[0].MaxTXID, "plan must overlap the snapshot")
+			},
+			headLevel: 0,
+		},
+		{
+			// The shape the compactor left before it carried straddlers up:
+			// L2 [6,9] straddles the snapshot [1,7] and L3 skipped it.
+			// Plan: L9 [1,7], L2 [6,9], L3 [10,12], L2 [13,14], L0 [15,15];
+			// B holds L3 [8,9], [10,12], [13,14], [15,15].
+			name: "OldCompactorShape",
+			build: func(n *forkNode) {
+				n.writeRows(4)
+				n.compact(1)
+				n.compact(2)
+				n.compact(3)
+				n.writeRows(2)
+				n.lateSnapshot(func() {
+					n.writeRows(2)
+					n.compact(1)
+					n.compact(2)
+				})
+				n.writeRows(3)
+				n.compact(1)
+				n.compact(2)
+				n.copyLTX(2, 10, 12, 3) // what L3 compaction did, seeking past the snapshot
+				n.writeRows(2)
+				n.compact(1)
+				n.compact(2)
+				n.writeRows(1)
+
+				plan, err := litestream.CalcRestorePlan(n.t.Context(), n.db.Replica.Client, 0, time.Time{}, slog.Default())
+				require.NoError(n.t, err)
+				var got []ltx.FileInfo
+				for _, info := range plan {
+					got = append(got, ltx.FileInfo{Level: info.Level, MinTXID: info.MinTXID, MaxTXID: info.MaxTXID})
+				}
+				require.Equal(n.t, []ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 7},
+					{Level: 2, MinTXID: 6, MaxTXID: 9},
+					{Level: 3, MinTXID: 10, MaxTXID: 12},
+					{Level: 2, MinTXID: 13, MaxTXID: 14},
+					{Level: 0, MinTXID: 15, MaxTXID: 15},
+				}, got)
 			},
 			headLevel: 0,
 		},
@@ -520,15 +576,21 @@ func TestCheckForkPlan(t *testing.T) {
 		{"HeadL0", []*ltx.FileInfo{snap, file(2, 5, 8), file(1, 9, 10), file(0, 11, 11)}, true},
 		{"HeadL2", []*ltx.FileInfo{snap, file(3, 5, 8), file(2, 9, 12)}, true},
 		{"SameLevelRun", []*ltx.FileInfo{snap, file(1, 5, 8), file(1, 9, 12)}, true},
-		{"Empty", nil, false},
-		{"NoSnapshot", []*ltx.FileInfo{file(3, 1, 8)}, false},
 		{"OverlapsSnapshot", []*ltx.FileInfo{snap, file(2, 3, 8)}, true},
 		{"OverlapsSnapshotThenLower", []*ltx.FileInfo{snap, file(3, 3, 8), file(2, 9, 12), file(0, 13, 13)}, true},
-		{"OverlapAfterSnapshot", []*ltx.FileInfo{snap, file(2, 5, 10), file(1, 8, 12)}, false},
-		{"OverlapFromTXID1", []*ltx.FileInfo{snap, file(2, 1, 8)}, false},
+		{"OverlapAfterSnapshot", []*ltx.FileInfo{snap, file(2, 5, 10), file(1, 8, 12)}, true},
+		{"OverlapFromTXID1", []*ltx.FileInfo{snap, file(2, 1, 8)}, true},
+		{"LevelIncreases", []*ltx.FileInfo{snap, file(1, 5, 8), file(2, 9, 12)}, true},
+		// The two production shapes: an L1 or L2 file straddling the snapshot,
+		// followed by a higher level that skipped it.
+		{"L1StraddlerThenL2", []*ltx.FileInfo{snap, file(1, 3, 6), file(2, 7, 10), file(1, 11, 12), file(0, 13, 13)}, true},
+		{"L2StraddlerThenL3", []*ltx.FileInfo{snap, file(2, 3, 6), file(3, 7, 10), file(2, 11, 12), file(0, 13, 13)}, true},
+		{"Empty", nil, false},
+		{"NoSnapshot", []*ltx.FileInfo{file(3, 1, 8)}, false},
 		{"WithinSnapshot", []*ltx.FileInfo{snap, file(2, 3, 4)}, false},
+		{"WithinPredecessor", []*ltx.FileInfo{snap, file(2, 5, 10), file(1, 7, 9)}, false},
 		{"GapAfterSnapshot", []*ltx.FileInfo{snap, file(2, 6, 8)}, false},
-		{"LevelIncreases", []*ltx.FileInfo{snap, file(1, 5, 8), file(2, 9, 12)}, false},
+		{"GapAfterFile", []*ltx.FileInfo{snap, file(2, 5, 8), file(1, 10, 12)}, false},
 		{"SecondSnapshot", []*ltx.FileInfo{snap, file(litestream.SnapshotLevel, 5, 8)}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -537,6 +599,71 @@ func TestCheckForkPlan(t *testing.T) {
 				require.NoError(t, err)
 			} else {
 				require.ErrorIs(t, err, litestream.ErrForkIneligible)
+			}
+		})
+	}
+}
+
+func TestForkTargets(t *testing.T) {
+	file := func(level int, minTXID, maxTXID ltx.TXID) *ltx.FileInfo {
+		return &ltx.FileInfo{Level: level, MinTXID: minTXID, MaxTXID: maxTXID}
+	}
+	target := func(level int, minTXID, maxTXID ltx.TXID) ltx.FileInfo {
+		return ltx.FileInfo{Level: level, MinTXID: minTXID, MaxTXID: maxTXID}
+	}
+	snap := file(litestream.SnapshotLevel, 1, 4)
+	snapTarget := target(litestream.SnapshotLevel, 1, 4)
+
+	for _, tc := range []struct {
+		name string
+		plan []*ltx.FileInfo
+		want []ltx.FileInfo
+	}{
+		{"SnapshotOnly", []*ltx.FileInfo{snap}, []ltx.FileInfo{snapTarget}},
+		{
+			// L0 files stay in L0 when nothing higher is in the plan.
+			"L0Only",
+			[]*ltx.FileInfo{snap, file(0, 5, 5), file(0, 6, 6)},
+			[]ltx.FileInfo{snapTarget, target(0, 5, 5), target(0, 6, 6)},
+		},
+		{
+			// Every file moves to the plan's highest level.
+			"Flattened",
+			[]*ltx.FileInfo{snap, file(2, 5, 8), file(1, 9, 10), file(0, 11, 11)},
+			[]ltx.FileInfo{snapTarget, target(2, 5, 8), target(2, 9, 10), target(2, 11, 11)},
+		},
+		{
+			// The second production shape: the straddler is renamed to start
+			// right after the snapshot, and the chain lands in L3.
+			"L2StraddlerThenL3",
+			[]*ltx.FileInfo{snap, file(2, 3, 6), file(3, 7, 10), file(2, 11, 12), file(0, 13, 13)},
+			[]ltx.FileInfo{snapTarget, target(3, 5, 6), target(3, 7, 10), target(3, 11, 12), target(3, 13, 13)},
+		},
+		{
+			// An overlap between two non-snapshot files is trimmed too.
+			"OverlapAfterSnapshot",
+			[]*ltx.FileInfo{snap, file(2, 5, 10), file(1, 8, 12)},
+			[]ltx.FileInfo{snapTarget, target(2, 5, 10), target(2, 11, 12)},
+		},
+		{
+			// A [1,k] file below the snapshot no longer reads as a snapshot.
+			"OverlapFromTXID1",
+			[]*ltx.FileInfo{snap, file(2, 1, 8)},
+			[]ltx.FileInfo{snapTarget, target(2, 5, 8)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, litestream.CheckForkPlan(tc.plan))
+			got := litestream.ForkTargets(tc.plan)
+			require.Equal(t, tc.want, got)
+
+			// The chain after the snapshot is exactly contiguous in one level.
+			for i := 2; i < len(got); i++ {
+				require.Equal(t, got[i-1].Level, got[i].Level, "target %d", i)
+				require.Equal(t, got[i-1].MaxTXID+1, got[i].MinTXID, "target %d", i)
+			}
+			if len(got) > 1 {
+				require.Equal(t, got[0].MaxTXID+1, got[1].MinTXID)
 			}
 		})
 	}
