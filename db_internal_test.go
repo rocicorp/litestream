@@ -7,8 +7,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/benbjohnson/litestream/internal"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/superfly/ltx"
+	"golang.org/x/sync/semaphore"
 	"io"
 	"log/slog"
+	_ "modernc.org/sqlite"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,13 +24,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus/testutil"
-	"github.com/superfly/ltx"
-	"golang.org/x/sync/semaphore"
-	_ "modernc.org/sqlite"
-
-	"github.com/benbjohnson/litestream/internal"
 )
 
 // testReplicaClient is a minimal mock for testing that doesn't cause import cycles.
@@ -1116,6 +1115,35 @@ func TestCalcWALSize(t *testing.T) {
 	}
 }
 
+// TestAddDurationToCounter ignores negative durations because Prometheus
+// counters cannot decrease. Negative durations can occur when the system clock
+// moves backwards between the start and end of an operation.
+func TestAddDurationToCounter(t *testing.T) {
+	tests := []struct {
+		name     string
+		duration time.Duration
+		want     float64
+	}{
+		{name: "positive", duration: 1500 * time.Millisecond, want: 1.5},
+		{name: "zero", duration: 0, want: 0},
+		{name: "negative", duration: -500 * time.Millisecond, want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			counter := prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "test_duration_seconds",
+				Help: "Test duration counter.",
+			})
+			addDurationToCounter(counter, tt.duration)
+
+			if got := testutil.ToFloat64(counter); got != tt.want {
+				t.Fatalf("counter value=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestDB_Sync_UpdatesMetrics verifies that DB size, WAL size, and total WAL bytes
 // metrics are properly updated during sync operations.
 // Regression test for issue #876: metrics were defined but never updated.
@@ -1963,110 +1991,6 @@ func TestDB_Verify_WALOffsetAtHeader(t *testing.T) {
 	// Salt matches, so snapshotting should be false
 	if info.snapshotting {
 		t.Errorf("expected snapshotting=false when salt matches, got true")
-	}
-}
-
-// TestDB_LastPageMatch_FastPathMatchesScan verifies that the cached-frame fast
-// path in lastPageMatch is populated after a sync and returns the same verify()
-// result as the full LTX scan it replaces.
-func TestDB_LastPageMatch_FastPathMatchesScan(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "db")
-
-	db := NewDB(dbPath)
-	db.MonitorInterval = 0
-	// Keep the WAL intact between syncs so verify() reaches lastPageMatch.
-	db.MinCheckpointPageN = 1 << 30
-	db.TruncatePageN = 1 << 30
-	db.CheckpointInterval = time.Hour
-	db.Replica = NewReplica(db)
-	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
-	db.Replica.MonitorEnabled = false
-	if err := db.Open(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := db.Close(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	sqldb, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sqldb.Close()
-
-	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal; PRAGMA wal_autocheckpoint = 0;`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqldb.Exec(`WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 200) INSERT INTO t (v) SELECT hex(randomblob(64)) FROM c`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Initial sync (snapshot).
-	if err := db.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	// A second batch + incremental sync so the latest LTX covers real WAL frames.
-	if _, err := sqldb.Exec(`WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 200) INSERT INTO t (v) SELECT hex(randomblob(64)) FROM c`); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Sync(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	// The cache should now hold the final frame of the latest LTX.
-	pos, err := db.Pos()
-	if err != nil {
-		t.Fatal(err)
-	}
-	sf := db.lastSyncedFrame
-	if sf == nil {
-		t.Fatal("expected lastSyncedFrame to be populated after sync")
-	}
-	if sf.txid != pos.TXID {
-		t.Fatalf("cached txid=%s, want pos txid=%s", sf.txid, pos.TXID)
-	}
-	if sf.walOffset <= WALHeaderSize {
-		t.Fatalf("cached walOffset=%d, want > %d", sf.walOffset, WALHeaderSize)
-	}
-
-	// Grow the WAL past the last sync (without overwriting it) so verify()
-	// reaches lastPageMatch rather than an early return.
-	if _, err := sqldb.Exec(`WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 50) INSERT INTO t (v) SELECT hex(randomblob(64)) FROM c`); err != nil {
-		t.Fatal(err)
-	}
-	db.invalidatePosCache()
-
-	// Warm cache: the fast path should confirm the WAL is unchanged.
-	warm, err := db.verify(context.Background(), &db.syncState)
-	if err != nil {
-		t.Fatalf("verify (warm cache): %v", err)
-	}
-
-	// Cold cache: the same call must fall back to the full scan and agree.
-	db.lastSyncedFrame = nil
-	cold, err := db.verify(context.Background(), &db.syncState)
-	if err != nil {
-		t.Fatalf("verify (cold cache): %v", err)
-	}
-
-	if warm.snapshotting != cold.snapshotting {
-		t.Errorf("snapshotting mismatch: warm=%v cold=%v", warm.snapshotting, cold.snapshotting)
-	}
-	if warm.offset != cold.offset {
-		t.Errorf("offset mismatch: warm=%d cold=%d", warm.offset, cold.offset)
-	}
-	if warm.reason != cold.reason {
-		t.Errorf("reason mismatch: warm=%q cold=%q", warm.reason, cold.reason)
-	}
-	if warm.snapshotting {
-		t.Errorf("expected snapshotting=false for an unmodified WAL, got true")
 	}
 }
 
@@ -4805,6 +4729,515 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 	case err := <-errCh:
 		t.Fatal(err)
 	default:
+	}
+}
+
+// Ensures the long-running read transaction outlives the context that was
+// passed to the call that acquired it. The control socket runs sync requests
+// on a request-scoped context that is cancelled when the request returns, and
+// database/sql rolls back a transaction when its BeginTx context is cancelled.
+// Regression test for issue #1578.
+func TestDB_ReadLockSurvivesContextCancel(t *testing.T) {
+	// assertLocked fails if the read transaction was rolled back under us.
+	assertLocked := func(t *testing.T, db *DB) {
+		t.Helper()
+		// database/sql rolls back asynchronously after cancellation, so give
+		// it time to happen before checking.
+		time.Sleep(200 * time.Millisecond)
+		if db.rtx == nil {
+			t.Fatal("expected read transaction")
+		}
+		if _, err := db.rtx.ExecContext(context.Background(), `SELECT COUNT(1) FROM _litestream_seq`); err != nil {
+			t.Fatalf("read lock was lost: %v", err)
+		}
+	}
+
+	setup := func(t *testing.T) (*DB, *sql.DB) {
+		t.Helper()
+		dbPath := filepath.Join(t.TempDir(), "db")
+
+		db := NewDB(dbPath)
+		db.MonitorInterval = 0
+		db.Replica = NewReplica(db)
+		db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+		db.Replica.MonitorEnabled = false
+		if err := db.Open(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close(context.Background()) })
+
+		sqldb, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = sqldb.Close() })
+		sqldb.SetMaxOpenConns(1)
+		if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+			t.Fatal(err)
+		}
+		return db, sqldb
+	}
+
+	t.Run("Init", func(t *testing.T) {
+		db, _ := setup(t)
+
+		// The first sync does the DB setup using the caller's context.
+		ctx, cancel := context.WithCancel(context.Background())
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+
+		assertLocked(t, db)
+	})
+
+	t.Run("Checkpoint", func(t *testing.T) {
+		db, _ := setup(t)
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := db.execCheckpoint(ctx, CheckpointModePassive); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+
+		assertLocked(t, db)
+	})
+}
+
+// mustOpenMetricsDB opens a DB backed by a temp-dir test replica.
+func mustOpenMetricsDB(t *testing.T, path string) *DB {
+	t.Helper()
+	db := NewDB(path)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func mustWriteAndSyncMetricsDB(t *testing.T, db *DB) {
+	t.Helper()
+	sqldb, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal; CREATE TABLE IF NOT EXISTS t (x); INSERT INTO t VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// gatherDBSeries returns the names of series in the default registry whose db
+// label is one of values.
+func gatherDBSeries(t *testing.T, values ...string) (names []string) {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range families {
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "db" && slices.Contains(values, lp.GetValue()) {
+					names = append(names, mf.GetName()+"{db="+lp.GetValue()+"}")
+				}
+			}
+		}
+	}
+	return names
+}
+
+func TestDB_CloseDeletesMetrics(t *testing.T) {
+	dir := t.TempDir()
+
+	var dbs []*DB
+	var values []string
+	for _, name := range []string{"close-metrics-a", "close-metrics-b"} {
+		path := filepath.Join(dir, name)
+		db := mustOpenMetricsDB(t, path)
+		mustWriteAndSyncMetricsDB(t, db)
+		if err := db.Checkpoint(context.Background(), CheckpointModePassive); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.EnforceL0RetentionByTime(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		// Only created on error, so touch it directly.
+		db.checkpointErrorNCounterVec.WithLabelValues(CheckpointModePassive).Inc()
+		dbs = append(dbs, db)
+		values = append(values, path, name)
+	}
+
+	// Closing one database must leave the other's series alone.
+	if err := dbs[0].Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, values[0], values[1]); len(got) != 0 {
+		t.Fatalf("series remain after close: %v", got)
+	}
+	if got := gatherDBSeries(t, values[2], values[3]); len(got) == 0 {
+		t.Fatal("closing one db deleted the other's series")
+	}
+
+	if err := dbs[1].Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, values...); len(got) != 0 {
+		t.Fatalf("series remain after close: %v", got)
+	}
+}
+
+func TestDB_ReopenKeepsMetrics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reopen-metrics")
+	db := mustOpenMetricsDB(t, path)
+	mustWriteAndSyncMetricsDB(t, db)
+	if err := db.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	mustWriteAndSyncMetricsDB(t, db)
+
+	// Gather before reading the vec, since reading would recreate the series.
+	if got := gatherDBSeries(t, path); len(got) == 0 {
+		t.Fatal("no series for reopened db")
+	}
+	if got := testutil.ToFloat64(syncNCounterVec.WithLabelValues(path)); got < 1 {
+		t.Fatalf("litestream_sync_count=%v after reopen, want >= 1", got)
+	}
+}
+
+func TestDB_ClosePreservesSharedMetrics(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "shared-metrics")
+	active := mustOpenMetricsDB(t, path)
+	t.Cleanup(func() {
+		if err := active.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	duplicate := mustOpenMetricsDB(t, path)
+	t.Cleanup(func() {
+		if err := duplicate.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := duplicate.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := duplicate.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	active.syncNCounter.Inc()
+	if got := gatherDBSeries(t, path); len(got) == 0 {
+		t.Fatal("closing duplicate deleted active database metrics")
+	}
+	if got := testutil.ToFloat64(syncNCounterVec.WithLabelValues(path)); got != 1 {
+		t.Fatalf("sync count=%v, want 1", got)
+	}
+	if err := duplicate.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if err := active.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	duplicate.syncNCounter.Inc()
+	if got := gatherDBSeries(t, path); len(got) == 0 {
+		t.Fatal("closing original deleted reopened database metrics")
+	}
+	if got := testutil.ToFloat64(syncNCounterVec.WithLabelValues(path)); got != 2 {
+		t.Fatalf("sync count=%v, want 2", got)
+	}
+	if err := duplicate.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, path); len(got) != 0 {
+		t.Fatalf("series remain after last close: %v", got)
+	}
+}
+
+func TestDB_ClosePreservesSharedRetentionMetrics(t *testing.T) {
+	ctx := context.Background()
+	name := t.Name()
+	a := mustOpenMetricsDB(t, filepath.Join(t.TempDir(), name))
+	b := mustOpenMetricsDB(t, filepath.Join(t.TempDir(), name))
+	for _, db := range []*DB{a, b} {
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	if err := b.EnforceL0RetentionByTime(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, name); len(got) != 3 {
+		t.Fatalf("retention series=%v, want three", got)
+	}
+	if err := a.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, name); len(got) != 3 {
+		t.Fatalf("closing same-basename database removed retention series: %v", got)
+	}
+	if err := b.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, name); len(got) != 0 {
+		t.Fatalf("retention series remain after last close: %v", got)
+	}
+}
+
+func TestDB_ConcurrentMetricOwners(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "concurrent-metrics")
+	active := NewDB(path)
+	t.Cleanup(func() {
+		if err := active.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				db := NewDB(path)
+				db.syncNCounter.Inc()
+				if err := db.Close(ctx); err != nil {
+					t.Error(err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if got := gatherDBSeries(t, path); len(got) == 0 {
+		t.Fatal("concurrent closes deleted active database metrics")
+	}
+	if got := testutil.ToFloat64(syncNCounterVec.WithLabelValues(path)); got != 400 {
+		t.Fatalf("sync count=%v, want 400", got)
+	}
+	if err := active.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, path); len(got) != 0 {
+		t.Fatalf("series remain after last close: %v", got)
+	}
+}
+
+func TestDB_LastPageMatch_ReusesVerifiedPage(t *testing.T) {
+	const pageSize = 512
+	const frameSize = WALFrameHeaderSize + pageSize
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	data := bytes.Repeat([]byte{3}, pageSize)
+	frame := make([]byte, frameSize)
+	binary.BigEndian.PutUint32(frame, 3)
+	binary.BigEndian.PutUint32(frame[8:], 1)
+	binary.BigEndian.PutUint32(frame[12:], 2)
+	copy(frame[WALFrameHeaderSize:], data)
+	wal := make([]byte, WALHeaderSize+2*frameSize)
+	copy(wal[WALHeaderSize+frameSize:], frame)
+	if err := os.WriteFile(db.WALPath(), wal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: pageSize, Commit: 3, MinTXID: 1, MaxTXID: 1, WALOffset: WALHeaderSize, WALSize: 2 * frameSize, WALSalt1: 1, WALSalt2: 2}); err != nil {
+		t.Fatal(err)
+	}
+	for pgno := uint32(1); pgno <= 3; pgno++ {
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, input := range [][]byte{buf.Bytes(), buf.Bytes()[:ltx.HeaderSize]} {
+		dec := ltx.NewDecoder(bytes.NewReader(input))
+		if err := dec.DecodeHeader(); err != nil {
+			t.Fatal(err)
+		}
+		if match, err := db.lastPageMatch(t.Context(), dec, WALHeaderSize+frameSize, frameSize); err != nil || !match {
+			t.Fatalf("lastPageMatch = %v, %v", match, err)
+		}
+	}
+}
+
+func TestDB_LastPageMatch_RejectsChangedWAL(t *testing.T) {
+	const pageSize = 512
+	const frameSize = WALFrameHeaderSize + pageSize
+	for _, field := range []string{"data", "page", "salt", "txid", "offset"} {
+		t.Run(field, func(t *testing.T) {
+			db := NewDB(filepath.Join(t.TempDir(), "db"))
+			header := ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: pageSize, Commit: 3, MinTXID: 1, MaxTXID: 1, WALOffset: WALHeaderSize, WALSize: 2 * frameSize, WALSalt1: 1, WALSalt2: 2}
+			data := bytes.Repeat([]byte{3}, pageSize)
+			db.lastLTXPage = &verifiedLTXPage{header: header, pgno: 3, data: bytes.Clone(data)}
+			frame := make([]byte, frameSize)
+			binary.BigEndian.PutUint32(frame, 3)
+			binary.BigEndian.PutUint32(frame[8:], 1)
+			binary.BigEndian.PutUint32(frame[12:], 2)
+			copy(frame[WALFrameHeaderSize:], data)
+			switch field {
+			case "data":
+				frame[WALFrameHeaderSize]++
+			case "page":
+				binary.BigEndian.PutUint32(frame, 2)
+			case "salt":
+				frame[8]++
+			case "txid":
+				header.MinTXID, header.MaxTXID = 2, 2
+			case "offset":
+				header.WALOffset += frameSize
+			}
+			wal := make([]byte, WALHeaderSize+2*frameSize)
+			copy(wal[WALHeaderSize+frameSize:], frame)
+			if err := os.WriteFile(db.WALPath(), wal, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			b, err := header.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			dec := ltx.NewDecoder(bytes.NewReader(b))
+			if err := dec.DecodeHeader(); err != nil {
+				t.Fatal(err)
+			}
+			if match, err := db.lastPageMatch(t.Context(), dec, WALHeaderSize+frameSize, frameSize); err != nil || match {
+				t.Fatalf("lastPageMatch = %v, %v", match, err)
+			}
+		})
+	}
+}
+
+type verificationLogHandler struct {
+	slog.Handler
+	verify func()
+}
+
+func (h *verificationLogHandler) Handle(ctx context.Context, record slog.Record) error {
+	if record.Message == "verify" {
+		h.verify()
+	}
+	return h.Handler.Handle(ctx, record)
+}
+
+func TestDB_CheckpointPassive_CachesLastLTXPage(t *testing.T) {
+	for _, cold := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cold=%v", cold), func(t *testing.T) {
+			ctx := t.Context()
+			path := filepath.Join(t.TempDir(), "db")
+			sqldb, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sqldb.Close()
+			sqldb.SetMaxOpenConns(1)
+			if _, err := sqldb.Exec(`PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t (data BLOB); INSERT INTO t VALUES (zeroblob(4194304)); PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
+				t.Fatal(err)
+			}
+			db := NewDB(path)
+			db.MonitorInterval = 0
+			db.CheckpointInterval = 0
+			db.MinCheckpointPageN = 1 << 30
+			db.TruncatePageN = 1 << 30
+			db.Replica = NewReplica(db)
+			db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+			db.Replica.MonitorEnabled = false
+			if err := db.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+				if err := db.Close(context.Background()); err != nil {
+					t.Error(err)
+				}
+			}()
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			assertCached := func() {
+				t.Helper()
+				page := db.lastLTXPage
+				if page == nil {
+					t.Fatal("last LTX page not cached")
+				}
+				f, err := os.Open(db.LTXPath(0, page.header.MinTXID, page.header.MaxTXID))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer f.Close()
+				dec := ltx.NewDecoder(io.LimitReader(f, ltx.HeaderSize))
+				if err := dec.DecodeHeader(); err != nil {
+					t.Fatal(err)
+				}
+				if dec.Header() != page.header {
+					t.Fatal("cached header differs from persisted LTX header")
+				}
+				frameSize := int64(WALFrameHeaderSize + db.pageSize)
+				offset := page.header.WALOffset + page.header.WALSize - frameSize
+				if match, err := db.lastPageMatch(ctx, dec, offset, frameSize); err != nil || !match {
+					t.Fatalf("cached match = %v, %v", match, err)
+				}
+			}
+			assertCached()
+			if cold {
+				db.lastLTXPage = nil
+			}
+			barriers := 0
+			db.Logger = slog.New(&verificationLogHandler{
+				Handler: slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}),
+				verify: func() {
+					if _, err := sqldb.Exec(`BEGIN IMMEDIATE`); err == nil {
+						if _, err := sqldb.Exec(`ROLLBACK`); err != nil {
+							t.Fatal(err)
+						}
+						return
+					} else if !isSQLiteBusyError(err) {
+						t.Fatal(err)
+					}
+					barriers++
+					assertCached()
+				},
+			})
+			if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+				t.Fatal(err)
+			}
+			if barriers == 0 {
+				t.Fatal("did not observe verification under the write barrier")
+			}
+			db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+			if _, err := sqldb.Exec(`INSERT INTO t VALUES (zeroblob(8192))`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			assertCached()
+		})
 	}
 }
 

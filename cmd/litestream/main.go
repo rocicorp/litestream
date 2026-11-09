@@ -145,60 +145,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	case "databases":
 		return (&DatabasesCommand{}).Run(ctx, args)
 	case "replicate":
-		c := NewReplicateCommand()
-		if err := c.ParseFlags(ctx, args); err != nil {
-			return err
-		}
-
-		// Setup signal handler.
-		signalCh := signalChan()
-
-		// Create done channel for interrupt during shutdown. It will be
-		// closed when a second signal arrives, allowing each database's
-		// retry loop to observe the interrupt.
-		done := make(chan struct{})
-		c.SetDone(done)
-
-		if err := c.Run(ctx); err != nil {
-			return err
-		}
-
-		// Wait for signal to stop program.
-		select {
-		case err = <-c.execCh:
-			if c.cmd != nil {
-				slog.Info("subprocess exited, litestream shutting down")
-			} else {
-				slog.Info("replication complete, litestream shutting down")
-			}
-		case sig := <-signalCh:
-			slog.Info("signal received, litestream shutting down", "signal", sig)
-
-			if c.cmd != nil {
-				slog.Info("sending signal to exec process")
-				if err := c.cmd.Process.Signal(sig); err != nil {
-					return fmt.Errorf("cannot signal exec process: %w", err)
-				}
-
-				slog.Info("waiting for exec process to close")
-				if err := <-c.execCh; err != nil && !strings.HasPrefix(err.Error(), "signal:") {
-					return fmt.Errorf("cannot wait for exec process: %w", err)
-				}
-			}
-
-			// Listen for a second signal to close done and interrupt retry loops.
-			go func() {
-				<-signalCh
-				close(done)
-			}()
-		}
-
-		// Gracefully close.
-		if e := c.Close(ctx); e != nil && err == nil {
-			err = e
-		}
-		slog.Info("litestream shut down")
-		return err
+		return m.runReplicate(ctx, args)
 
 	case "start":
 		return (&StartCommand{}).Run(ctx, args)
@@ -318,6 +265,7 @@ type Config struct {
 	MCPAddr string `yaml:"mcp-addr"`
 
 	// Shutdown sync retry settings
+	ShutdownTimeout      time.Duration  `yaml:"-"`
 	ShutdownSyncTimeout  *time.Duration `yaml:"shutdown-sync-timeout"`
 	ShutdownSyncInterval *time.Duration `yaml:"shutdown-sync-interval"`
 
@@ -431,6 +379,7 @@ func DefaultConfig() Config {
 		Socket:                   litestream.DefaultSocketConfig(),
 		L0Retention:              &defaultL0Retention,
 		L0RetentionCheckInterval: &defaultL0RetentionCheckInterval,
+		ShutdownTimeout:          30 * time.Second,
 		ShutdownSyncTimeout:      &defaultShutdownSyncTimeout,
 		ShutdownSyncInterval:     &defaultShutdownSyncInterval,
 	}
@@ -602,6 +551,25 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+func (c *Config) warnSnapshotRetention() {
+	warn := func(field string, snapshot SnapshotConfig) {
+		if snapshot.Interval != nil && snapshot.Retention != nil && *snapshot.Retention < *snapshot.Interval {
+			slog.Warn("snapshot retention is shorter than snapshot interval",
+				"field", field,
+				"retention", *snapshot.Retention,
+				"interval", *snapshot.Interval)
+		}
+	}
+	warn("snapshot.retention", c.Snapshot)
+	for _, db := range c.DBs {
+		dbIdentifier := db.Path
+		if dbIdentifier == "" {
+			dbIdentifier = db.Dir
+		}
+		warn(fmt.Sprintf("dbs[%s].snapshot.retention", dbIdentifier), db.Snapshot)
+	}
+}
+
 // CompactionLevels returns a full list of compaction levels include L0.
 func (c *Config) CompactionLevels() litestream.CompactionLevels {
 	levels := litestream.CompactionLevels{
@@ -682,7 +650,8 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	}
 
 	var raw struct {
-		Snapshot *SnapshotConfig `yaml:"snapshot"`
+		Snapshot        *SnapshotConfig `yaml:"snapshot"`
+		ShutdownTimeout interface{}     `yaml:"shutdown-timeout"`
 	}
 	if err := yaml.Unmarshal(buf, &raw); err != nil {
 		return config, err
@@ -743,7 +712,20 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		config.Logging.Level = v
 	}
-	internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
+	internal.InitLog(os.Stderr, config.Logging.Level, config.Logging.Type, config.Logging.Source)
+	config.warnSnapshotRetention()
+	if raw.ShutdownTimeout != nil {
+		value, ok := raw.ShutdownTimeout.(string)
+		timeout, err := time.ParseDuration(value)
+		if !ok || err != nil || timeout <= 0 {
+			slog.Warn("invalid shutdown-timeout; using default", "value", raw.ShutdownTimeout, "default", config.ShutdownTimeout)
+		} else {
+			config.ShutdownTimeout = timeout
+		}
+	}
+	if logOutput != os.Stderr {
+		internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
+	}
 
 	return config, nil
 }
@@ -1159,19 +1141,20 @@ type ReplicaSettings struct {
 	AutoRecover *bool `yaml:"auto-recover"`
 
 	// S3 settings
-	AccessKeyID        string    `yaml:"access-key-id"`
-	SecretAccessKey    string    `yaml:"secret-access-key"`
-	Region             string    `yaml:"region"`
-	Bucket             string    `yaml:"bucket"`
-	Endpoint           string    `yaml:"endpoint"`
-	ForcePathStyle     *bool     `yaml:"force-path-style"`
-	SignPayload        *bool     `yaml:"sign-payload"`
-	SignAcceptEncoding *bool     `yaml:"sign-accept-encoding"`
-	RequireContentMD5  *bool     `yaml:"require-content-md5"`
-	SkipVerify         bool      `yaml:"skip-verify"`
-	StorageClass       string    `yaml:"storage-class"`
-	PartSize           *ByteSize `yaml:"part-size"`
-	Concurrency        *int      `yaml:"concurrency"`
+	AccessKeyID         string    `yaml:"access-key-id"`
+	SecretAccessKey     string    `yaml:"secret-access-key"`
+	Region              string    `yaml:"region"`
+	Bucket              string    `yaml:"bucket"`
+	Endpoint            string    `yaml:"endpoint"`
+	ForcePathStyle      *bool     `yaml:"force-path-style"`
+	SignPayload         *bool     `yaml:"sign-payload"`
+	SignAcceptEncoding  *bool     `yaml:"sign-accept-encoding"`
+	RequireContentMD5   *bool     `yaml:"require-content-md5"`
+	PutObjectContentMD5 *bool     `yaml:"put-object-content-md5"`
+	SkipVerify          bool      `yaml:"skip-verify"`
+	StorageClass        string    `yaml:"storage-class"`
+	PartSize            *ByteSize `yaml:"part-size"`
+	Concurrency         *int      `yaml:"concurrency"`
 
 	// Multipart download settings. Independent of part-size/concurrency, which
 	// configure uploads. Set download-concurrency to 0 to disable multipart
@@ -1277,6 +1260,9 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if rs.RequireContentMD5 == nil {
 		rs.RequireContentMD5 = src.RequireContentMD5
+	}
+	if rs.PutObjectContentMD5 == nil {
+		rs.PutObjectContentMD5 = src.PutObjectContentMD5
 	}
 	if src.SkipVerify {
 		rs.SkipVerify = true
@@ -1510,6 +1496,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	bucket, configPath := c.Bucket, c.Path
 	region, endpoint, skipVerify := c.Region, c.Endpoint, c.SkipVerify
 	storageClass := c.StorageClass
+	putObjectContentMD5 := false
 	signSetting := newBoolSetting(true)
 	if v := c.SignPayload; v != nil {
 		signSetting.Set(*v)
@@ -1526,6 +1513,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	// Use path style if an endpoint is explicitly set. This works because the
 	// only service to not use path style is AWS which does not use an endpoint.
 	forcePathStyle := (endpoint != "")
+	forcePathStyleSet := c.ForcePathStyle != nil
 	if v := c.ForcePathStyle; v != nil {
 		forcePathStyle = *v
 	}
@@ -1571,6 +1559,9 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 			uregion = litestream.RegionFromS3ARN(host)
 		} else {
 			ubucket, uregion, uendpoint, uforcePathStyle = s3.ParseHost(host)
+			if litestream.IsNeonEndpoint(uendpoint) && (endpoint != "" || query.Get("endpoint") != "") {
+				ubucket, uregion, uendpoint, uforcePathStyle = host, "", "", false
+			}
 		}
 
 		// Override with query parameters if provided
@@ -1587,8 +1578,9 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		if qRegion := query.Get("region"); qRegion != "" {
 			uregion = qRegion
 		}
-		if qForcePathStyle := query.Get("forcePathStyle"); qForcePathStyle != "" {
-			uforcePathStyle = qForcePathStyle == "true"
+		if v, ok := litestream.BoolQueryValue(query, "forcePathStyle", "force-path-style"); ok {
+			uforcePathStyle = v
+			forcePathStyleSet = true
 		}
 		if qSkipVerify := query.Get("skipVerify"); qSkipVerify != "" {
 			skipVerify = qSkipVerify == "true"
@@ -1604,6 +1596,9 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		if v, ok := litestream.BoolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
 			urequireContentMD5 = v
 			urequireContentMD5Set = true
+		}
+		if v, ok := litestream.BoolQueryValue(query, "putObjectContentMD5", "put-object-content-md5"); ok {
+			putObjectContentMD5 = v
 		}
 		if v := query.Get("storageClass"); v != "" {
 			ustorageClass = v
@@ -1654,7 +1649,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		if storageClass == "" {
 			storageClass = ustorageClass
 		}
-		if !forcePathStyle {
+		if c.ForcePathStyle == nil && !forcePathStyle {
 			forcePathStyle = uforcePathStyle
 		}
 		if !signSetting.set && usignPayloadSet {
@@ -1687,9 +1682,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	isMinIO := litestream.IsMinIOEndpoint(endpoint)
 	isCloudflareR2 := litestream.IsCloudflareR2Endpoint(endpoint)
 	isSupabase := litestream.IsSupabaseEndpoint(endpoint)
-
-	// Track if forcePathStyle was explicitly set by user (config or URL query param).
-	forcePathStyleSet := c.ForcePathStyle != nil
+	isNeon := litestream.IsNeonEndpoint(endpoint)
 
 	// Apply provider-specific defaults for S3-compatible providers.
 	// These settings ensure compatibility with each provider's S3 implementation.
@@ -1698,13 +1691,13 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		signSetting.ApplyDefault(true)
 		requireSetting.ApplyDefault(false)
 	}
-	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
+	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase || isNeon {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		signSetting.ApplyDefault(true)
 	}
 	if !forcePathStyleSet {
-		// Filebase, Backblaze B2, MinIO, and Supabase require path-style URLs
-		if isFilebase || isBackblaze || isMinIO || isSupabase {
+		// Filebase, Backblaze B2, MinIO, Supabase, and Neon require path-style URLs
+		if isFilebase || isBackblaze || isMinIO || isSupabase || isNeon {
 			forcePathStyle = true
 		}
 	}
@@ -1724,6 +1717,10 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.SignPayload = signSetting.value
 	client.SignAcceptEncoding = signAcceptEncodingSetting.value
 	client.RequireContentMD5 = requireSetting.value
+	client.PutObjectContentMD5 = putObjectContentMD5
+	if v := c.PutObjectContentMD5; v != nil {
+		client.PutObjectContentMD5 = *v
+	}
 
 	if isCloudflareR2 {
 		client.Concurrency = s3.DefaultR2Concurrency

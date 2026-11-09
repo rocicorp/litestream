@@ -75,6 +75,18 @@ jobs:
       - name: Verify shared library created
         run: file dist/litestream-vfs-linux-amd64.so
 
+  vfs-unit-test:
+    name: VFS Unit Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go test -tags vfs -race -count=1 .
+
   build-windows:
     name: Build Windows
     runs-on: ubuntu-latest
@@ -95,6 +107,18 @@ jobs:
           GOOS: windows
           GOARCH: amd64
           CC: x86_64-w64-mingw32-gcc
+
+  test-windows:
+    name: Test Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go test -v ./internal
 
   docker-smoke-test:
     name: Docker Smoke Test
@@ -237,7 +261,7 @@ jobs:
 
       - run: go install ./cmd/litestream
 
-      - run: ./etc/s3_mock.py go test -v ./replica_client_test.go -integration s3
+      - run: ./etc/s3_mock.py go test -v ./replica_client_test.go -integration -replica-clients=s3
 
   minio-integration-test:
     name: Run MinIO Integration Tests
@@ -368,7 +392,7 @@ jobs:
 
       - run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration nats
+      - run: go test -v ./replica_client_test.go -integration -replica-clients=nats
         env:
           LITESTREAM_NATS_URL: "nats://localhost:4222"
           LITESTREAM_NATS_BUCKET: "litestream-test"
@@ -397,7 +421,7 @@ jobs:
 
       - run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration s3
+      - run: go test -v ./replica_client_test.go -integration -replica-clients=s3
         env:
           LITESTREAM_S3_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
           LITESTREAM_S3_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_S3_SECRET_ACCESS_KEY }}
@@ -428,7 +452,7 @@ jobs:
 
       - run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration gs
+      - run: go test -v ./replica_client_test.go -integration -replica-clients=gs
         env:
           GOOGLE_APPLICATION_CREDENTIALS:  /opt/gcp.json
           LITESTREAM_GS_BUCKET:           integration.litestream.io
@@ -451,7 +475,7 @@ jobs:
 
       - run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration abs
+      - run: go test -v ./replica_client_test.go -integration -replica-clients=abs
         env:
           LITESTREAM_ABS_ACCOUNT_NAME:     ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
           LITESTREAM_ABS_ACCOUNT_KEY:      ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
@@ -520,7 +544,7 @@ jobs:
 
       - run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration sftp
+      - run: go test -v ./replica_client_test.go -integration -replica-clients=sftp
         env:
           LITESTREAM_SFTP_HOST:     "localhost:2222"
           LITESTREAM_SFTP_USER:     "root"
@@ -616,7 +640,7 @@ jobs:
 
       - run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration webdav
+      - run: go test -v ./replica_client_test.go -integration -replica-clients=webdav
         env:
           LITESTREAM_WEBDAV_URL:      "http://localhost:8080"
           LITESTREAM_WEBDAV_USERNAME: "testuser"

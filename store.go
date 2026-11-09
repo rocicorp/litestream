@@ -7,12 +7,32 @@ import (
 	"log/slog"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/errgroup"
+)
+
+var (
+	validationChecksCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "litestream_validation_checks_total",
+		Help: "Number of replica validation checks by result (success, invalid, or error).",
+	}, []string{"db", "level", "result"})
+
+	lastValidationSuccessGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_last_validation_success",
+		Help: "Whether the last replica validation check succeeded (1) or failed (0). Zero before the first check completes.",
+	}, []string{"db", "level"})
+
+	lastValidationSuccessTimestampGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_last_validation_success_timestamp_seconds",
+		Help: "Unix time of the last successful replica validation check. Zero until a check succeeds.",
+	}, []string{"db", "level"})
 )
 
 var (
@@ -834,7 +854,7 @@ LOOP:
 				continue // skip disabled DBs
 			}
 			if err := db.EnforceL0RetentionByTime(ctx); err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if isShutdownError(ctx, err) {
 					continue
 				}
 				db.Logger.Error("l0 retention enforcement failed", "path", db.Path(), "error", err)
@@ -1057,7 +1077,7 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 	}
 
 	// Skip if there are no new files to compact.
-	if srcInfo.MaxTXID <= dstInfo.MinTXID {
+	if srcInfo.MaxTXID <= dstInfo.MaxTXID {
 		return nil, ErrNoCompaction
 	}
 
@@ -1124,13 +1144,24 @@ func (s *Store) Validate(ctx context.Context) (*ValidationResult, error) {
 		}
 
 		for _, lvl := range levels {
+			level := strconv.Itoa(lvl.Level)
+			lastSuccess := lastValidationSuccessTimestampGaugeVec.WithLabelValues(db.Path(), level)
+			success := lastValidationSuccessGaugeVec.WithLabelValues(db.Path(), level)
 			errs, err := db.Replica.ValidateLevel(ctx, lvl.Level)
 			if err != nil {
+				validationChecksCounterVec.WithLabelValues(db.Path(), level, "error").Inc()
+				success.Set(0)
 				return nil, fmt.Errorf("validate level %d for %s: %w", lvl.Level, db.Path(), err)
 			}
 			if len(errs) > 0 {
+				validationChecksCounterVec.WithLabelValues(db.Path(), level, "invalid").Inc()
+				success.Set(0)
 				result.Valid = false
 				result.Errors = append(result.Errors, errs...)
+			} else {
+				validationChecksCounterVec.WithLabelValues(db.Path(), level, "success").Inc()
+				success.Set(1)
+				lastSuccess.SetToCurrentTime()
 			}
 		}
 	}
@@ -1155,7 +1186,7 @@ LOOP:
 
 		result, err := s.Validate(ctx)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if isShutdownError(ctx, err) {
 				continue
 			}
 			s.Logger.Error("validation check failed", "error", err)
