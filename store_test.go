@@ -285,7 +285,10 @@ func TestStore_CompactDB(t *testing.T) {
 		}
 		defer s.Close(t.Context())
 
-		for _, query := range []string{`CREATE TABLE t (id INT);`, `INSERT INTO t (id) VALUES (100)`} {
+		// TXID 1 is the base snapshot, uploaded to the snapshot level and
+		// skipped by L1 compaction, so two more transactions are needed for
+		// an L1 file that spans more than one.
+		for _, query := range []string{`CREATE TABLE t (id INT);`, `INSERT INTO t (id) VALUES (100)`, `INSERT INTO t (id) VALUES (101)`} {
 			if _, err := sqldb0.ExecContext(t.Context(), query); err != nil {
 				t.Fatal(err)
 			} else if err := db0.Sync(t.Context()); err != nil {
@@ -316,7 +319,7 @@ func TestStore_CompactDB(t *testing.T) {
 		time.Sleep(levels[1].Interval)
 		info, err = s.CompactDB(t.Context(), db0, levels[1])
 		require.NoError(t, err)
-		require.Equal(t, ltx.TXID(3), info.MaxTXID)
+		require.Equal(t, ltx.TXID(4), info.MaxTXID)
 	})
 
 	// Regression test for GitHub issue #877: level 9 compaction fails with
@@ -844,7 +847,13 @@ func (c *slowSnapshotClient) WriteLTXFile(ctx context.Context, level int, minTXI
 	if level != litestream.SnapshotLevel {
 		return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
 	}
-	c.started <- struct{}{}
+	// The base snapshot is uploaded to the snapshot level by the replica
+	// sync as well, so more than one upload can arrive here; the test
+	// observes the first and must not be blocked by the rest.
+	select {
+	case c.started <- struct{}{}:
+	default:
+	}
 	buf := make([]byte, 4096)
 	var err error
 	for err == nil {
@@ -854,7 +863,10 @@ func (c *slowSnapshotClient) WriteLTXFile(ctx context.Context, level int, minTXI
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		err = nil
 	}
-	c.drained <- err
+	select {
+	case c.drained <- err:
+	default:
+	}
 	if err != nil {
 		return nil, err
 	}
