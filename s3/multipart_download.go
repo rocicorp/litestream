@@ -205,14 +205,100 @@ func sharedChunkPool(size int, partSize int64) *chunkPool {
 	return sharedPool
 }
 
-// downloadChunk is a single ranged GET in flight or waiting to be consumed.
+// Straggler handling.
+//
+// The consumer takes parts in order, so one slow connection idles every buffer
+// behind it: the other parts finish, nothing new can be issued until the head
+// part lands, and throughput collapses to that one connection for the tail of
+// every window. Rather than wait, the reader splits the head part's remaining
+// byte range and fetches the top half on a fresh connection, repeatedly, while
+// there is proven idle capacity (parts finished but not yet consumed). Pieces
+// write disjoint regions of one buffer, so no memory is added. Each request covers
+// only its piece's current range; if a split lands while a request is already
+// streaming, that connection stops at the new end and is closed, so the only
+// bytes transferred twice are those already in flight on it. A piece whose connection stops delivering bytes altogether is
+// aborted so the normal retry path reopens it from where it stopped.
+const (
+	// hedgeMinIdle is how many finished-but-unconsumed parts must be queued
+	// behind the head part before it is split. Each is a connection that has
+	// gone idle, so a split only ever uses capacity already paid for.
+	hedgeMinIdle = 2
+
+	// hedgeMaxPieces bounds the connections a single part may fan out to.
+	hedgeMaxPieces = 8
+)
+
+// Vars so tests can shorten them.
+var (
+	// hedgeCheckInterval is how often a consumer blocked on a part looks at it.
+	hedgeCheckInterval = 250 * time.Millisecond
+
+	// hedgeMinAge is how long a part must have been in flight before it is
+	// split; younger parts are simply not done yet.
+	hedgeMinAge = 2 * time.Second
+
+	// hedgeMinPiece is the smallest remaining range worth a new connection.
+	hedgeMinPiece = int64(1 << 20)
+
+	// pieceReadStep is how much a piece reads per call. A split may not cut
+	// below the end of the read in flight, so this bounds split granularity.
+	pieceReadStep = int64(512 << 10)
+
+	// stallTimeout is how long a piece may go without a byte before its
+	// connection is aborted and reopened.
+	stallTimeout = 15 * time.Second
+
+	// connectStagger is the minimum spacing between connection opens by one
+	// reader. Opening the whole pool in the same millisecond gets a large
+	// fraction of the connections reset by S3 (observed: ~30 of 48), which
+	// the SDK then retries a second later; spacing them out avoids the
+	// resets and the lost second.
+	connectStagger = 10 * time.Millisecond
+)
+
+// downloadPiece is one connection's share of a chunk: the byte range
+// [from, to) of the chunk buffer. to can be lowered by a split, never below
+// the end of the read in progress.
+type downloadPiece struct {
+	mu          sync.Mutex
+	from        int64
+	off         int64 // next byte to receive
+	to          int64
+	inflightEnd int64 // end of the read in progress
+	lastByte    time.Time
+	cancel      context.CancelFunc // aborts the attempt in progress
+}
+
+// downloadChunk is one part, fetched by one or more pieces, in flight or
+// waiting to be consumed.
 type downloadChunk struct {
 	idx    int64
 	buf    []byte
 	n      int
 	err    error
-	done   chan struct{}
-	doneAt time.Time // when the fetch finished; for consumer-lag accounting
+	done   chan struct{} // closed once every piece has finished
+	doneAt time.Time     // when the fetch finished; for consumer-lag accounting
+	began  time.Time
+
+	mu       sync.Mutex
+	pieces   []*downloadPiece // disjoint, covering [0, len) between them
+	active   int              // pieces still running
+	attempts int              // connections opened across all pieces
+	retries  int              // reopens after a failure, across all pieces
+}
+
+// reserveRetry claims one of the chunk's downloadPartAttempts-1 retries,
+// reporting false when the budget is spent. The budget is per chunk, not per
+// piece, so splitting a part never multiplies the connections a broken range
+// may open; a split's own first connection is bounded by hedgeMaxPieces.
+func (ch *downloadChunk) reserveRetry() bool {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	if ch.retries+1 >= downloadPartAttempts {
+		return false
+	}
+	ch.retries++
+	return true
 }
 
 // multipartReader reassembles an object from parallel ranged GETs.
@@ -245,22 +331,32 @@ type multipartReader struct {
 	// below. liveIdx is -1 while no chunk is live.
 	live    io.ReadCloser
 	liveIdx int64
-	liveLen int64 // bytes in the live chunk
-	livePos int64 // bytes of the live chunk delivered so far
-	reopens int   // connections opened for the live chunk; see downloadPartAttempts
+	// liveStall closes the live body if a read on it delivers nothing for
+	// stallTimeout; liveStalled records that it fired, for the log line.
+	liveStall   *time.Timer
+	liveStalled atomic.Bool
+	liveLen     int64 // bytes in the live chunk
+	livePos     int64 // bytes of the live chunk delivered so far
+	reopens     int   // connections opened for the live chunk; see downloadPartAttempts
+
+	// nextOpen is the earliest time the next connection may be opened; see
+	// connectStagger. Guarded by openMu since every piece goroutine consults it.
+	openMu   sync.Mutex
+	nextOpen time.Time
 
 	// Diagnostics, reported at debug level. partRetries is written by fetch
-	// goroutines; the rest only by the reading goroutine. netWait is time the
-	// consumer spent blocked on a part still in flight; consumerLag is how
-	// long finished parts sat before the consumer took them. Large lag with
-	// little wait means the consumer, not the network, is the bottleneck.
+	// goroutines; the rest only by the reading goroutine.
 	started     time.Time
 	bytesOut    int64
 	partRetries atomic.Int64
-	netWait     time.Duration
-	netWaits    int64
-	consumerLag time.Duration
+	liveChunks  int64
+	netWait     time.Duration // time Read spent blocked on a part still in flight
+	netWaits    int64         // number of such waits
+	consumerLag time.Duration // sum over parts of (consumed - downloaded)
 	maxLag      time.Duration
+	splits      int64        // pieces spawned by straggler splitting
+	stallAborts int64        // connections aborted for delivering nothing
+	ready       atomic.Int64 // parts finished but not yet consumed
 
 	mu        sync.Mutex
 	pending   map[int64]*downloadChunk
@@ -326,50 +422,316 @@ func (r *multipartReader) schedule() {
 		if buf == nil {
 			return
 		}
-		ch := &downloadChunk{idx: r.nextFetch, buf: buf, done: make(chan struct{})}
+		ch := &downloadChunk{idx: r.nextFetch, buf: buf, done: make(chan struct{}), began: time.Now()}
 		r.pending[ch.idx] = ch
 		r.nextFetch++
-		r.wg.Add(1)
-		go r.fetch(ch)
+		ch.mu.Lock()
+		r.startPieceLocked(ch, 0, r.chunkLen(ch.idx))
+		ch.mu.Unlock()
 	}
 }
 
-// fetch downloads one chunk into its buffer, retrying in place so a transient
-// failure does not discard the progress of the whole download.
-func (r *multipartReader) fetch(ch *downloadChunk) {
+// startPieceLocked starts a piece fetching [from, to) of ch. ch.mu must be held.
+func (r *multipartReader) startPieceLocked(ch *downloadChunk, from, to int64) {
+	p := &downloadPiece{from: from, off: from, to: to, lastByte: time.Now()}
+	ch.pieces = append(ch.pieces, p)
+	ch.active++
+	r.wg.Add(1)
+	go r.fetch(ch, p)
+}
+
+// fetch downloads one piece of a chunk into its region of the buffer,
+// retrying in place so a transient failure does not discard the progress of
+// the whole download. The last piece to finish completes the chunk.
+func (r *multipartReader) fetch(ch *downloadChunk, p *downloadPiece) {
 	defer r.wg.Done()
-	defer close(ch.done)
-	defer func() { ch.doneAt = time.Now() }()
+	defer r.finishPiece(ch)
 
 	start := r.base + ch.idx*r.partSize
-	length := r.chunkLen(ch.idx)
-
-	var off int64
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 && !r.backoff(attempt) {
-			ch.err = fmt.Errorf("s3: download part %d of %s at offset %d: %w", ch.idx, r.key, start+off, r.ctx.Err())
+			r.failPiece(ch, p, start, r.ctx.Err())
+			return
+		}
+		if !r.waitConnectSlot() {
+			r.failPiece(ch, p, start, r.ctx.Err())
+			return
+		}
+		if ch.failed() {
+			return // a sibling piece failed; the chunk is already lost
+		}
+
+		// Each attempt resumes from the last byte received, so a piece that
+		// keeps progressing across disconnects still completes. The attempt
+		// has its own context so a stalled read can be aborted without
+		// cancelling its siblings. The range is read after the stagger wait
+		// so a split that landed during it is reflected in the request, and
+		// lastByte restarts so a new connection gets the full stallTimeout.
+		ctx, cancel := context.WithCancel(r.ctx)
+		p.mu.Lock()
+		off, to := p.off, p.to
+		if off >= to {
+			p.mu.Unlock()
+			cancel()
+			return // a split took everything that was left
+		}
+		p.cancel = cancel
+		p.lastByte = time.Now()
+		p.mu.Unlock()
+
+		ch.mu.Lock()
+		ch.attempts++
+		ch.mu.Unlock()
+
+		rc, err := r.c.getRange(ctx, r.key, start+off, to-off)
+		if err == nil {
+			err = r.readPiece(rc, ch, p)
+			_ = rc.Close()
+		}
+		p.mu.Lock()
+		p.cancel = nil
+		p.mu.Unlock()
+		cancel()
+		if err == nil || ch.failed() {
 			return
 		}
 
-		// Each attempt resumes from the last byte received, so a chunk that
-		// keeps progressing across disconnects still completes.
-		n, err := r.c.readRange(r.ctx, r.key, start+off, length-off, ch.buf[off:length])
-		off += n
-		if off >= length {
-			ch.n = int(length)
-			return
-		}
-		if err == nil {
-			err = io.ErrUnexpectedEOF
-		}
-		if !r.retryable(err) || attempt+1 >= downloadPartAttempts {
-			ch.err = fmt.Errorf("s3: download part %d of %s at offset %d: %w", ch.idx, r.key, start+off, err)
+		if !r.retryable(err) || !ch.reserveRetry() {
+			r.failPiece(ch, p, start, err)
 			return
 		}
 		r.partRetries.Add(1)
+		p.mu.Lock()
+		off = p.off
+		p.mu.Unlock()
 		r.c.logger.Debug("download part failed, retrying",
-			"part", ch.idx, "offset", start+off, "received", off, "attempt", attempt+1, "error", err)
+			"part", ch.idx, "piece", p.from, "offset", start+off, "received", off-p.from, "attempt", attempt+1, "error", err)
 	}
+}
+
+// waitConnectSlot claims the next connection-open slot and sleeps until it
+// arrives, reporting false if the download was cancelled first.
+func (r *multipartReader) waitConnectSlot() bool {
+	if connectStagger <= 0 {
+		return true
+	}
+	r.openMu.Lock()
+	now := time.Now()
+	at := r.nextOpen
+	if at.Before(now) {
+		at = now
+	}
+	r.nextOpen = at.Add(connectStagger)
+	r.openMu.Unlock()
+
+	wait := time.Until(at)
+	if wait <= 0 {
+		return true
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-r.ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// readPiece copies rc into the piece's range one underlying read at a time,
+// each capped at pieceReadStep, so a split can cut the range short at a step
+// boundary and the stall check sees every byte as it lands rather than once
+// per step. Returns nil once the piece has all its bytes.
+func (r *multipartReader) readPiece(rc io.Reader, ch *downloadChunk, p *downloadPiece) error {
+	for {
+		p.mu.Lock()
+		if p.off >= p.to {
+			p.mu.Unlock()
+			return nil
+		}
+		off := p.off
+		end := min(off+pieceReadStep, p.to)
+		p.inflightEnd = end
+		p.mu.Unlock()
+
+		n, err := rc.Read(ch.buf[off:end])
+
+		p.mu.Lock()
+		p.off += int64(n)
+		if n > 0 {
+			p.lastByte = time.Now()
+		}
+		done := p.off >= p.to
+		p.mu.Unlock()
+
+		if err != nil {
+			if done && err == io.EOF {
+				return nil
+			}
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return err
+		}
+	}
+}
+
+// failPiece records the first error for the chunk and cancels every sibling
+// attempt, so the consumer sees the error as soon as those attempts unwind
+// rather than after the slowest sibling finishes. The chunk still completes
+// only when every piece has returned, since the buffer cannot go back to the
+// pool while any of them might write into it.
+func (r *multipartReader) failPiece(ch *downloadChunk, p *downloadPiece, start int64, err error) {
+	p.mu.Lock()
+	off := p.off
+	p.mu.Unlock()
+
+	ch.mu.Lock()
+	first := ch.err == nil
+	if first {
+		ch.err = fmt.Errorf("s3: download part %d of %s at offset %d: %w", ch.idx, r.key, start+off, err)
+	}
+	pieces := ch.pieces
+	ch.mu.Unlock()
+	if !first {
+		return
+	}
+	for _, q := range pieces {
+		if q == p {
+			continue
+		}
+		q.mu.Lock()
+		if q.cancel != nil {
+			q.cancel()
+		}
+		q.mu.Unlock()
+	}
+}
+
+// failed reports whether a piece of the chunk has hit a terminal error.
+func (ch *downloadChunk) failed() bool {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return ch.err != nil
+}
+
+// finishPiece retires one piece and, when it was the last, completes the chunk.
+func (r *multipartReader) finishPiece(ch *downloadChunk) {
+	ch.mu.Lock()
+	ch.active--
+	last := ch.active == 0
+	pieces, attempts, err := len(ch.pieces), ch.attempts, ch.err
+	ch.mu.Unlock()
+	if !last {
+		return
+	}
+	length := r.chunkLen(ch.idx)
+	if err == nil {
+		ch.n = int(length)
+		elapsed := time.Since(ch.began)
+		r.c.logger.Debug("download part done",
+			"part", ch.idx, "offset", r.base+ch.idx*r.partSize, "bytes", length,
+			"pieces", pieces, "attempts", attempts,
+			"elapsed", elapsed.Round(time.Millisecond), "mbps", mbps(length, elapsed))
+	}
+	ch.doneAt = time.Now()
+	r.ready.Add(1)
+	close(ch.done)
+}
+
+// awaitChunk blocks until ch is complete, checking it periodically for
+// stragglers while it waits.
+func (r *multipartReader) awaitChunk(ch *downloadChunk) {
+	t := time.Now()
+	defer func() {
+		r.netWait += time.Since(t)
+		r.netWaits++
+	}()
+
+	select {
+	case <-ch.done:
+		return
+	default:
+	}
+	tick := time.NewTicker(hedgeCheckInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ch.done:
+			return
+		case <-tick.C:
+			r.hedge(ch)
+		}
+	}
+}
+
+// hedge is run for the head-of-line chunk while the consumer is blocked on
+// it. It aborts any piece whose connection has delivered nothing for
+// stallTimeout, and, when idle capacity has built up behind the chunk, hands
+// the top half of the largest outstanding range to a new connection.
+func (r *multipartReader) hedge(ch *downloadChunk) {
+	now := time.Now()
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+
+	for _, p := range ch.pieces {
+		p.mu.Lock()
+		if p.cancel != nil && p.off < p.to && now.Sub(p.lastByte) > stallTimeout {
+			p.cancel()
+			p.lastByte = now // one abort per stall
+			r.stallAborts++
+			r.c.logger.Debug("download part stalled, reconnecting",
+				"part", ch.idx, "piece", p.from, "offset", p.off, "remaining", p.to-p.off)
+		}
+		p.mu.Unlock()
+	}
+
+	// Each hedge connection is backed by one idle connection: a part that has
+	// finished but not been consumed. Pieces still running beyond the primary
+	// hold their slot until they finish, so a chunk cannot fan out past the
+	// capacity that actually went idle.
+	idle := r.ready.Load()
+	if ch.err != nil || ch.active == 0 || len(ch.pieces) >= hedgeMaxPieces ||
+		now.Sub(ch.began) < hedgeMinAge || idle < hedgeMinIdle || int64(ch.active-1) >= idle {
+		return
+	}
+
+	// Split the piece with the most bytes still to come, at the end of the
+	// read it has in flight so the two never overlap.
+	var best *downloadPiece
+	var bestCut, bestRem int64
+	for _, p := range ch.pieces {
+		p.mu.Lock()
+		cut := max(p.inflightEnd, p.off)
+		rem := p.to - cut
+		p.mu.Unlock()
+		if rem > bestRem {
+			best, bestCut, bestRem = p, cut, rem
+		}
+	}
+	if best == nil || bestRem < 2*hedgeMinPiece {
+		return
+	}
+	mid := bestCut + bestRem/2
+	best.mu.Lock()
+	// Re-read under the piece lock: the read in flight may have advanced.
+	if cut := max(best.inflightEnd, best.off); cut > bestCut {
+		bestCut = cut
+		mid = bestCut + (best.to-bestCut)/2
+	}
+	if best.to-mid < hedgeMinPiece || mid-bestCut < hedgeMinPiece {
+		best.mu.Unlock()
+		return
+	}
+	oldTo := best.to
+	best.to = mid
+	best.mu.Unlock()
+
+	r.startPieceLocked(ch, mid, oldTo)
+	r.splits++
+	r.c.logger.Debug("download part split",
+		"part", ch.idx, "at", mid, "remaining", oldTo-mid, "pieces", len(ch.pieces),
+		"idle", r.ready.Load(), "age", now.Sub(ch.began).Round(time.Millisecond))
 }
 
 // backoff waits out the delay for the given attempt, reporting false if the
@@ -408,10 +770,7 @@ func (r *multipartReader) Read(p []byte) (int, error) {
 			return n, err
 		}
 		if wait != nil {
-			t := time.Now()
-			<-wait.done
-			r.netWait += time.Since(t)
-			r.netWaits++
+			r.awaitChunk(wait)
 			continue
 		}
 
@@ -456,6 +815,9 @@ func (r *multipartReader) advance(p []byte) (int, *downloadChunk, error) {
 				// the reader can never be held up by its peers. Chunks are
 				// requested in order, so nothing past this one is in flight
 				// either; look-ahead resumes from the chunk after it.
+				r.liveChunks++
+				r.c.logger.Debug("no pool buffer for part, streaming live",
+					"part", r.nextRead, "held", r.lease.held, "pending", len(r.pending))
 				r.startLive(r.nextRead, nil)
 				r.nextFetch = r.nextRead + 1
 				r.schedule()
@@ -507,6 +869,7 @@ func (r *multipartReader) retire() {
 		}
 	}
 	delete(r.pending, r.cur.idx)
+	r.ready.Add(-1)
 	r.lease.release(r.cur.buf)
 	r.lease.consumed()
 	r.cur, r.curOff = nil, 0
@@ -528,13 +891,16 @@ func (r *multipartReader) progressLocked() {
 	r.c.logger.Debug("download progress",
 		"parts", r.nextRead, "of", r.lastIdx+1, "bytes", r.bytesOut, "total", r.total,
 		"elapsed", elapsed.Round(time.Second), "mbps", mbps(r.bytesOut, elapsed),
-		"window", r.lease.held, "in-flight", len(r.pending), "part-retries", r.partRetries.Load(),
+		"window", r.lease.held, "in-flight", len(r.pending),
+		"part-retries", r.partRetries.Load(), "live-chunks", r.liveChunks,
 		"net-wait", r.netWait.Round(time.Millisecond), "net-waits", r.netWaits,
-		"consumer-lag-avg", r.avgLag().Round(time.Millisecond), "consumer-lag-max", r.maxLag.Round(time.Millisecond))
+		"consumer-lag-avg", r.avgLag().Round(time.Millisecond), "consumer-lag-max", r.maxLag.Round(time.Millisecond),
+		"splits", r.splits, "stall-aborts", r.stallAborts)
 }
 
 // avgLag is the mean time a downloaded part sat in its buffer before the
-// consumer took it.
+// consumer took it. Large values with little net-wait mean the consumer, not
+// the network, is the bottleneck.
 func (r *multipartReader) avgLag() time.Duration {
 	if r.nextRead <= 1 {
 		return 0
@@ -590,17 +956,23 @@ func (r *multipartReader) readLive(p []byte) (int, error) {
 			}
 			r.reopens++
 
+			if r.reopens > 1 {
+				r.c.logger.Debug("live part reconnecting",
+					"part", r.liveIdx, "offset", r.liveOffset(), "remaining", remain, "connection", r.reopens)
+			}
 			rc, err := r.c.getRange(r.ctx, r.key, r.liveOffset(), remain)
 			if err != nil {
 				if !r.retryable(err) {
 					return 0, fail(err)
 				}
+				r.c.logger.Debug("live part open failed",
+					"part", r.liveIdx, "offset", r.liveOffset(), "connection", r.reopens, "error", err)
 				continue
 			}
 			r.live = rc
 		}
 
-		n, err := r.live.Read(p)
+		n, err := r.readLiveOnce(p)
 		r.livePos += int64(n)
 		if err != nil || r.livePos >= r.liveLen {
 			// Either the chunk is complete or the stream broke; drop it so the
@@ -620,10 +992,44 @@ func (r *multipartReader) readLive(p []byte) (int, error) {
 		if !r.retryable(err) {
 			return 0, fail(err)
 		}
+		if r.liveStalled.Swap(false) {
+			r.stallAborts++
+			r.c.logger.Debug("live part stalled, reconnecting",
+				"part", r.liveIdx, "offset", r.liveOffset(), "remaining", r.liveLen-r.livePos)
+		}
+		r.c.logger.Debug("live part read failed",
+			"part", r.liveIdx, "offset", r.liveOffset(), "connection", r.reopens, "error", err)
 	}
 }
 
+// readLiveOnce reads the live body under a stall watchdog. The live chunk is
+// read on the consumer's goroutine, so nothing else is watching it: without
+// the watchdog an open response that stops sending would block the restore
+// forever. Closing the body from the timer makes the pending Read fail, and
+// readLive reopens from the current offset under its reopen budget.
+func (r *multipartReader) readLiveOnce(p []byte) (int, error) {
+	if stallTimeout <= 0 {
+		return r.live.Read(p)
+	}
+	if r.liveStall == nil {
+		rc := r.live
+		r.liveStall = time.AfterFunc(stallTimeout, func() {
+			r.liveStalled.Store(true)
+			_ = rc.Close()
+		})
+	} else {
+		r.liveStall.Reset(stallTimeout)
+	}
+	n, err := r.live.Read(p)
+	r.liveStall.Stop()
+	return n, err
+}
+
 func (r *multipartReader) closeLive() {
+	if r.liveStall != nil {
+		r.liveStall.Stop()
+		r.liveStall = nil
+	}
 	if r.live != nil {
 		_ = r.live.Close()
 		r.live = nil
@@ -649,10 +1055,10 @@ func (r *multipartReader) Close() error {
 	r.c.logger.Debug("multipart download closed",
 		"key", r.key, "bytes", r.bytesOut, "total", r.total, "parts", r.lastIdx+1,
 		"elapsed", elapsed.Round(time.Millisecond), "mbps", mbps(r.bytesOut, elapsed),
-		"part-retries", r.partRetries.Load(),
+		"part-retries", r.partRetries.Load(), "live-chunks", r.liveChunks,
 		"net-wait", r.netWait.Round(time.Millisecond), "net-waits", r.netWaits,
 		"consumer-lag-avg", r.avgLag().Round(time.Millisecond), "consumer-lag-max", r.maxLag.Round(time.Millisecond),
-		"err", r.err)
+		"splits", r.splits, "stall-aborts", r.stallAborts, "err", r.err)
 
 	r.mu.Lock()
 	if r.cur != nil {
