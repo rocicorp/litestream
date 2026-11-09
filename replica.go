@@ -534,7 +534,7 @@ func (r *Replica) monitor(ctx context.Context) {
 			}
 
 			// Don't log context cancellation errors during shutdown
-			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if !isShutdownError(ctx, err) {
 				consecutiveErrs++
 
 				// Exponential backoff: SyncInterval -> 2x -> 4x -> ... -> max
@@ -699,11 +699,28 @@ func newRestoreDecoder(r io.Reader) *ltx.Decoder {
 // page index spills into spillDir past the encoder's threshold, so compacting
 // a large database does not hold a per-page index in memory either (#1486).
 func newRestoreCompactor(w io.Writer, rdrs []io.Reader, spillDir string) (*ltx.Compactor, error) {
+	if len(rdrs) == 0 {
+		return nil, fmt.Errorf("at least one input reader required")
+	}
+
+	last := len(rdrs) - 1
+	finalHeader, replay, err := ltx.PeekHeader(rdrs[last])
+	if err != nil {
+		return nil, fmt.Errorf("peek final input header: %w", err)
+	}
+	if closer, ok := rdrs[last].(io.Closer); ok {
+		rdrs[last] = internal.NewReadCloser(replay, closer)
+	} else {
+		rdrs[last] = replay
+	}
+
 	c, err := ltx.NewCompactor(w, rdrs)
 	if err != nil {
 		return nil, err
 	}
-	c.HeaderFlags = ltx.HeaderFlagNoChecksum
+	if finalHeader.NoChecksum() {
+		c.HeaderFlags = ltx.HeaderFlagNoChecksum
+	}
 	c.SetSpillDir(spillDir)
 	return c, nil
 }
@@ -766,8 +783,20 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 				if latestSnapshot.MinTXID > txid {
 					return fmt.Errorf("cannot resume follow mode: saved TXID %s is behind the earliest snapshot (min TXID %s); replica history has been pruned -- delete %s and %s-txid to re-restore", txid, latestSnapshot.MinTXID, opt.OutputPath, opt.OutputPath)
 				}
-				if txid > latestSnapshot.MaxTXID {
-					return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of latest snapshot (max TXID %s); delete %s and %s-txid to re-restore", txid, latestSnapshot.MaxTXID, opt.OutputPath, opt.OutputPath)
+
+				// A follow file legitimately runs ahead of the latest snapshot, so bound the check by the newest TXID across all levels.
+				var maxTXID ltx.TXID
+				for level := 0; level <= SnapshotLevel; level++ {
+					info, infoErr := r.MaxLTXFileInfo(ctx, level)
+					if infoErr != nil {
+						return fmt.Errorf("cannot validate saved TXID for crash recovery: %w", infoErr)
+					}
+					if info.MaxTXID > maxTXID {
+						maxTXID = info.MaxTXID
+					}
+				}
+				if txid > maxTXID {
+					return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of the replica's latest TXID %s; delete %s and %s-txid to re-restore", txid, maxTXID, opt.OutputPath, opt.OutputPath)
 				}
 			}
 
@@ -801,67 +830,6 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	if err != nil {
 		return fmt.Errorf("cannot calc restore plan: %w", err)
 	}
-	restoreCtx, cancelRestore := context.WithCancel(ctx)
-	defer cancelRestore()
-
-	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
-
-	var fork *restoreForker
-	if opt.Fork != nil {
-		opt.Fork.Forked, opt.Fork.TXID = false, 0
-		if fork, err = r.prepareFork(restoreCtx, opt, infos); err != nil {
-			return err
-		}
-		if fork != nil {
-			defer func() {
-				if err != nil {
-					fork.abort(fmt.Errorf("restore failed: %w", err))
-				}
-			}()
-		}
-	}
-
-	// Every stream boundary below is buffered. The LTX decoder issues several
-	// small reads per page (page header, size prefix, compressed block);
-	// unbuffered, each is a syscall or a mutex round trip into the storage
-	// reader, and on a multi-GB snapshot that per-page overhead, not
-	// decompression or the network, bounds the restore.
-	const restoreBufSize = 1 << 20
-
-	rdrs := make([]io.Reader, 0, len(infos))
-	closers := make([]io.Closer, 0, len(infos))
-	closeReaders := func() {
-		for _, c := range closers {
-			_ = c.Close()
-		}
-		closers = nil
-	}
-	defer closeReaders()
-
-	for i, info := range infos {
-		// Validate file size - must be at least header size to be readable
-		if info.Size < ltx.HeaderSize {
-			return fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
-				info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
-		}
-
-		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
-
-		rr := internal.NewResumableReader(restoreCtx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger())
-		closers = append(closers, rr)
-		// The tee sits under the buffer, where the resumable reader has
-		// already hidden retries behind one continuous stream, so it sees
-		// each byte of the file exactly once.
-		var rd io.Reader = rr
-		if fork != nil {
-			rd = fork.tee(i, rr)
-		}
-		rdrs = append(rdrs, bufio.NewReaderSize(rd, restoreBufSize))
-	}
-
-	if len(rdrs) == 0 {
-		return fmt.Errorf("no matching backup files available")
-	}
 
 	// Create parent directory if it doesn't exist.
 	var dirInfo os.FileInfo
@@ -874,7 +842,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Output to temp file & atomically rename.
 	tmpOutputPath := opt.OutputPath + ".tmp"
-	r.Logger().Debug("restoring into database", "path", tmpOutputPath, "n", len(rdrs))
+	r.Logger().Debug("restoring into database", "path", tmpOutputPath, "n", len(infos))
 	defer func() { _ = os.Remove(tmpOutputPath) }()
 
 	f, err := os.Create(tmpOutputPath)
@@ -883,31 +851,35 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	// A plan is a snapshot followed by zero or more deltas in TXID order.
-	// Decode the snapshot straight into the file, then write each delta's
-	// pages in place; applyRestoreDeltas explains why this replaces merging
-	// every file through a compactor.
-	fw := bufio.NewWriterSize(f, restoreBufSize)
-	snapshot := newRestoreDecoder(rdrs[0])
-	if err := snapshot.DecodeDatabaseTo(fw); err != nil {
-		return fmt.Errorf("decode database: %w", err)
-	}
-	if err := fw.Flush(); err != nil {
-		return fmt.Errorf("flush database: %w", err)
-	}
-	if err := applyRestoreDeltas(f, snapshot.Header(), rdrs[1:]); err != nil {
-		return fmt.Errorf("apply ltx files: %w", err)
-	}
-	if fork != nil {
-		// The decoders read each file to its end; reading on to EOF
-		// completes each copy regardless.
-		for _, rd := range rdrs {
-			if _, err := io.Copy(io.Discard, rd); err != nil {
-				return fmt.Errorf("fork: drain ltx file: %w", err)
-			}
+	// A plan file can be deleted by retention between planning and reading
+	// it. Recalculate the plan for the same target TXID and start over, a
+	// bounded number of times.
+	var fork *restoreForker
+	targetTXID := infos[len(infos)-1].MaxTXID
+	for attempt := 0; ; attempt++ {
+		fork, err = r.restorePlan(ctx, opt, f, infos)
+		if err == nil {
+			break
 		}
-		if err := fork.wait(); err != nil {
-			return fmt.Errorf("fork: %w", err)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if attempt >= 3 {
+			return fmt.Errorf("restore plan retries exhausted for txid %s: %w", targetTXID, err)
+		}
+		r.Logger().Debug("restore file disappeared, recalculating plan", "target", targetTXID, "attempt", attempt+1, "error", err)
+		infos, err = CalcRestorePlan(ctx, r.Client, targetTXID, time.Time{}, r.Logger())
+		if err != nil {
+			return fmt.Errorf("cannot recalculate restore plan for txid %s: %w", targetTXID, err)
+		}
+		if err := f.Truncate(0); err != nil {
+			return err
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
 		}
 	}
 
@@ -949,12 +921,6 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Enter follow mode if enabled, continuously applying new LTX files.
 	if opt.Follow {
-		// follow runs until the context is cancelled, so release the
-		// snapshot's streams and pool buffers now rather than holding them
-		// for the whole session; the deferred call is then a no-op.
-		closeReaders()
-		rdrs = nil
-
 		maxTXID := infos[len(infos)-1].MaxTXID
 		if err := WriteTXIDFile(opt.OutputPath, maxTXID); err != nil {
 			return fmt.Errorf("write initial txid file: %w", err)
@@ -963,6 +929,136 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	return nil
+}
+
+// restoreOpenConcurrency bounds how many restore-plan files are opened at
+// once. The compactor decodes every input's header in plan order before it
+// reads a page, so lazily opened inputs cost one object-store round trip each,
+// in series.
+const restoreOpenConcurrency = 32
+
+// openRestoreFiles opens every file of a restore plan concurrently. A file
+// that fails to open has a nil stream; its ResumableReader retries it on
+// first read.
+func (r *Replica) openRestoreFiles(ctx context.Context, infos []*ltx.FileInfo) ([]*internal.ResumableReader, error) {
+	readers := make([]*internal.ResumableReader, 0, len(infos))
+	sem := semaphore.NewWeighted(restoreOpenConcurrency)
+	var wg sync.WaitGroup
+	for _, info := range infos {
+		rd := internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger())
+		readers = append(readers, rd)
+		if err := sem.Acquire(ctx, 1); err != nil {
+			wg.Wait()
+			for _, rd := range readers {
+				_ = rd.Close()
+			}
+			return nil, err
+		}
+		wg.Go(func() {
+			defer sem.Release(1)
+			r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
+			if err := rd.Open(); err != nil {
+				r.Logger().Debug("open ltx file for restore failed; the reader retries it", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID, "error", err)
+			}
+		})
+	}
+	wg.Wait()
+	return readers, nil
+}
+
+// restorePlan materializes the plan infos into f. A plan is a snapshot
+// followed by zero or more deltas in TXID order: the snapshot is decoded
+// straight into the file, then each delta's pages are written in place;
+// applyRestoreDeltas explains why this replaces merging every file through a
+// compactor. With opt.Fork set, every plan file is also copied into the fork
+// replica as it is read; the returned forker is finished by the caller once
+// the database is in place, and is nil when the plan cannot fork. On error the
+// fork is aborted here, and a retry with a new plan starts a new one; the
+// files the aborted copy left behind then make the fork replica non-empty, so
+// the retry restores without forking.
+func (r *Replica) restorePlan(ctx context.Context, opt RestoreOptions, f *os.File, infos []*ltx.FileInfo) (fork *restoreForker, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
+
+	for _, info := range infos {
+		// Validate file size - must be at least header size to be readable
+		if info.Size < ltx.HeaderSize {
+			return nil, fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
+				info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
+		}
+	}
+
+	if opt.Fork != nil {
+		opt.Fork.Forked, opt.Fork.TXID = false, 0
+		if fork, err = r.prepareFork(ctx, opt, infos); err != nil {
+			return nil, err
+		}
+		if forker := fork; forker != nil {
+			defer func() {
+				if err != nil {
+					forker.abort(fmt.Errorf("restore failed: %w", err))
+				}
+			}()
+		}
+	}
+
+	readers, err := r.openRestoreFiles(ctx, infos)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		for _, rd := range readers {
+			_ = rd.Close()
+		}
+	}()
+
+	// Every stream boundary below is buffered. The LTX decoder issues several
+	// small reads per page (page header, size prefix, compressed block);
+	// unbuffered, each is a syscall or a mutex round trip into the storage
+	// reader, and on a multi-GB snapshot that per-page overhead, not
+	// decompression or the network, bounds the restore.
+	const restoreBufSize = 1 << 20
+
+	rdrs := make([]io.Reader, 0, len(readers))
+	for i, rr := range readers {
+		// The tee sits under the buffer, where the resumable reader has
+		// already hidden retries behind one continuous stream, so it sees
+		// each byte of the file exactly once.
+		var rd io.Reader = rr
+		if fork != nil {
+			rd = fork.tee(i, rr)
+		}
+		rdrs = append(rdrs, bufio.NewReaderSize(rd, restoreBufSize))
+	}
+	if len(rdrs) == 0 {
+		return nil, fmt.Errorf("no matching backup files available")
+	}
+
+	fw := bufio.NewWriterSize(f, restoreBufSize)
+	snapshot := newRestoreDecoder(rdrs[0])
+	if err := snapshot.DecodeDatabaseTo(fw); err != nil {
+		return nil, fmt.Errorf("decode database: %w", err)
+	}
+	if err := fw.Flush(); err != nil {
+		return nil, fmt.Errorf("flush database: %w", err)
+	}
+	if err := applyRestoreDeltas(f, snapshot.Header(), rdrs[1:]); err != nil {
+		return nil, fmt.Errorf("apply ltx files: %w", err)
+	}
+	if fork != nil {
+		// The decoders read each file to its end; reading on to EOF
+		// completes each copy regardless.
+		for _, rd := range rdrs {
+			if _, err := io.Copy(io.Discard, rd); err != nil {
+				return nil, fmt.Errorf("fork: drain ltx file: %w", err)
+			}
+		}
+		if err := fork.wait(); err != nil {
+			return nil, fmt.Errorf("fork: %w", err)
+		}
+	}
+	return fork, nil
 }
 
 // follow enters a continuous restore loop, polling for new LTX files and

@@ -96,16 +96,17 @@ type ReplicaClient struct {
 	SecretAccessKey string
 
 	// S3 bucket information
-	Region             string
-	Bucket             string
-	Path               string
-	Endpoint           string
-	ForcePathStyle     bool
-	SkipVerify         bool
-	SignPayload        bool
-	SignAcceptEncoding bool
-	RequireContentMD5  bool
-	StorageClass       string
+	Region              string
+	Bucket              string
+	Path                string
+	Endpoint            string
+	ForcePathStyle      bool
+	SkipVerify          bool
+	SignPayload         bool
+	SignAcceptEncoding  bool
+	RequireContentMD5   bool
+	PutObjectContentMD5 bool
+	StorageClass        string
 
 	// Upload configuration
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
@@ -187,6 +188,9 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		region = litestream.RegionFromS3ARN(host)
 	} else {
 		bucket, region, endpoint, forcePathStyle = ParseHost(host)
+		if litestream.IsNeonEndpoint(endpoint) && (query.Get("endpoint") != "" || os.Getenv("LITESTREAM_S3_ENDPOINT") != "") {
+			bucket, region, endpoint, forcePathStyle = host, "", "", false
+		}
 	}
 
 	// Override with query parameters if provided
@@ -219,6 +223,9 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	if v, ok := litestream.BoolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
 		requireMD5 = v
 		requireMD5Set = true
+	}
+	if v, ok := litestream.BoolQueryValue(query, "putObjectContentMD5", "put-object-content-md5"); ok {
+		client.PutObjectContentMD5 = v
 	}
 	if v, ok, err := litestream.IntQueryValue(query, "concurrency"); err != nil {
 		return nil, err
@@ -290,6 +297,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	isCloudflareR2 := litestream.IsCloudflareR2Endpoint(endpoint)
 	isMinIO := litestream.IsMinIOEndpoint(endpoint)
 	isSupabase := litestream.IsSupabaseEndpoint(endpoint)
+	isNeon := litestream.IsNeonEndpoint(endpoint)
 
 	// Apply provider-specific defaults for S3-compatible providers.
 	if isTigris {
@@ -307,15 +315,15 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 			client.PartSize = DefaultTigrisPartSize
 		}
 	}
-	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
+	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase || isNeon {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		if !signPayloadSet {
 			signPayload, signPayloadSet = true, true
 		}
 	}
 	if !forcePathStyleSet {
-		// Filebase, Backblaze B2, MinIO, and Supabase require path-style URLs
-		if isFilebase || isBackblaze || isMinIO || isSupabase {
+		// Filebase, Backblaze B2, MinIO, Supabase, and Neon require path-style URLs
+		if isFilebase || isBackblaze || isMinIO || isSupabase || isNeon {
 			forcePathStyle = true
 		}
 	}
@@ -621,7 +629,7 @@ func (c *ReplicaClient) validateSSEConfig() error {
 
 // transportRetryMaxAttempts caps total attempts per operation; exponential
 // backoff between attempts still bounds request rate during outages.
-const transportRetryMaxAttempts = 10
+const transportRetryMaxAttempts = 8
 
 // newTransportRetryer returns a retryer that keeps retrying through sustained
 // object-store transport flaps. The SDK's default token bucket (and the
@@ -632,6 +640,7 @@ const transportRetryMaxAttempts = 10
 func newTransportRetryer(logger *slog.Logger) aws.Retryer {
 	return retry.NewStandard(func(o *retry.StandardOptions) {
 		o.MaxAttempts = transportRetryMaxAttempts
+		o.MaxBackoff = time.Second
 		o.RateLimiter = ratelimit.None
 		// S3-compatible providers (observed: Tigris) load-shed with HTTP 408
 		// and api error code "RequestCanceled", neither of which the SDK
@@ -643,7 +652,8 @@ func newTransportRetryer(logger *slog.Logger) aws.Retryer {
 		o.Retryables = append([]retry.IsErrorRetryable{retryErrorLogger{logger: logger}}, o.Retryables...)
 		o.Retryables = append(o.Retryables,
 			retry.RetryableHTTPStatusCode{Codes: map[int]struct{}{
-				http.StatusRequestTimeout: {},
+				http.StatusRequestTimeout:  {},
+				http.StatusTooManyRequests: {},
 			}},
 			retry.RetryableErrorCode{Codes: map[string]struct{}{
 				"RequestCanceled": {},
@@ -966,9 +976,9 @@ func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, rs io.Re
 	input := c.putObjectInput(key, timestamp)
 	input.Body = rs
 
-	if size < partSize {
+	if size < partSize || (c.PutObjectContentMD5 && size == partSize) {
 		input.ContentLength = aws.Int64(size)
-		out, err := c.s3.PutObject(ctx, input)
+		out, err := c.putObject(ctx, input)
 		if err != nil {
 			return 0, time.Time{}, nil, fmt.Errorf("s3: put object %s: %w", key, err)
 		}
@@ -1005,7 +1015,7 @@ func (c *ReplicaClient) uploadStreamedLTX(ctx context.Context, key string, r io.
 	if size := int64(buf.Len()); size < partSize {
 		input.Body = bytes.NewReader(buf.Bytes())
 		input.ContentLength = aws.Int64(size)
-		out, err := c.s3.PutObject(ctx, input)
+		out, err := c.putObject(ctx, input)
 		if err != nil {
 			return 0, time.Time{}, nil, fmt.Errorf("s3: put object %s: %w", key, err)
 		}
@@ -1020,6 +1030,26 @@ func (c *ReplicaClient) uploadStreamedLTX(ctx context.Context, key string, r io.
 		return 0, time.Time{}, nil, fmt.Errorf("s3: upload to %s: %w", key, err)
 	}
 	return rc.N(), timestamp, out.ETag, nil
+}
+
+func (c *ReplicaClient) putObject(ctx context.Context, input *s3.PutObjectInput) (*s3.PutObjectOutput, error) {
+	if c.PutObjectContentMD5 && input.ContentMD5 == nil && input.ContentLength != nil && *input.ContentLength >= 0 {
+		if body, ok := input.Body.(io.ReadSeeker); ok {
+			start, err := body.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return nil, fmt.Errorf("s3: checksum body position: %w", err)
+			}
+			hash := md5.New()
+			if _, err := io.CopyN(hash, body, *input.ContentLength); err != nil {
+				return nil, fmt.Errorf("s3: checksum body: %w", err)
+			}
+			if _, err := body.Seek(start, io.SeekStart); err != nil {
+				return nil, fmt.Errorf("s3: rewind checksum body: %w", err)
+			}
+			input.ContentMD5 = aws.String(base64.StdEncoding.EncodeToString(hash.Sum(nil)))
+		}
+	}
+	return c.s3.PutObject(ctx, input)
 }
 
 // putObjectInput returns a PutObjectInput populated with the client's write
@@ -1992,6 +2022,13 @@ func ParseHost(host string) (bucket, region, endpoint string, forcePathStyle boo
 		bucket = a[1]
 		endpoint = fmt.Sprintf("s3.%s.scw.cloud", region)
 		return bucket, region, endpoint, false
+	} else if a := neonRegex.FindStringSubmatch(host); len(a) > 1 {
+		// Neon endpoints are per-branch, so the bucket is prefixed to the
+		// branch endpoint host and requests must use path-style URLs.
+		bucket = a[1]
+		region = a[3]
+		endpoint = "https://" + a[2]
+		return bucket, region, endpoint, true
 	}
 
 	// For standard S3, the host is the bucket name
@@ -2004,6 +2041,7 @@ var (
 	backblazeRegex    = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.backblazeb2.com$`)
 	filebaseRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.filebase.com$`)
 	scalewayRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.scw\.cloud$`)
+	neonRegex         = regexp.MustCompile(`^(.+)\.(br-[^.]+\.storage\.[^.]+\.([^.]+)\.[^.]+\.neon\.tech)$`)
 )
 
 func isNotExists(err error) bool {

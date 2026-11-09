@@ -82,6 +82,8 @@ type DB struct {
 	syncState    syncState
 	syncDiag     diagState
 
+	lastLTXPage *verifiedLTXPage
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -130,6 +132,7 @@ type DB struct {
 	Done   <-chan struct{}
 
 	// Metrics
+	metricsRegistered           bool
 	dbSizeGauge                 prometheus.Gauge
 	walSizeGauge                prometheus.Gauge
 	totalWALBytesCounter        prometheus.Counter
@@ -214,6 +217,33 @@ type DB struct {
 
 	// Where to send log messages, defaults to global slog with database epath.
 	Logger *slog.Logger
+}
+
+type verifiedLTXPage struct {
+	header ltx.Header
+	pgno   uint32
+	data   []byte
+}
+
+type ltxPageEncoder interface {
+	Header() ltx.Header
+	EncodePage(ltx.PageHeader, []byte) error
+}
+
+type verifyingLTXEncoder struct {
+	*ltx.Encoder
+	page verifiedLTXPage
+}
+
+func (enc *verifyingLTXEncoder) EncodePage(hdr ltx.PageHeader, data []byte) error {
+	if err := enc.Encoder.EncodePage(hdr, data); err != nil {
+		return err
+	}
+	if hdr.Pgno == enc.page.pgno {
+		enc.page.header = enc.Header()
+		enc.page.data = bytes.Clone(data)
+	}
+	return nil
 }
 
 // syncState holds mutable sync-tracking fields extracted from DB.
@@ -355,25 +385,13 @@ func NewDB(path string) *DB {
 	db.passes.notify = make(chan struct{})
 	db.openLTXFile = defaultOpenLTXFile
 
-	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
-	db.walSizeGauge = walSizeGaugeVec.WithLabelValues(db.path)
-	db.totalWALBytesCounter = totalWALBytesCounterVec.WithLabelValues(db.path)
-	db.txIDGauge = txIDIndexGaugeVec.WithLabelValues(db.path)
-	db.syncNCounter = syncNCounterVec.WithLabelValues(db.path)
-	db.syncErrorNCounter = syncErrorNCounterVec.WithLabelValues(db.path)
-	db.syncSecondsCounter = syncSecondsCounterVec.WithLabelValues(db.path)
-	db.diskFullGauge = diskFullGaugeVec.WithLabelValues(db.path)
-	db.checkpointNCounterVec = checkpointNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
-	db.checkpointErrorNCounterVec = checkpointErrorNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
-	db.checkpointSecondsCounterVec = checkpointSecondsCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
-
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
 	// Initialize compactor with nil client (set once in Open() from Replica.Client).
 	db.compactor = NewCompactor(nil, db.Logger.With(LogKeySubsystem, LogSubsystemCompactor))
 	db.compactor.LocalFileOpener = db.openLocalLTXFile
 	db.compactor.LocalFileDeleter = db.deleteLocalLTXFile
-	db.compactor.CompactionVerifyErrorCounter = compactionVerifyErrorCounterVec.WithLabelValues(db.path)
+	db.initMetrics()
 	db.compactor.CacheGetter = func(level int) (*ltx.FileInfo, bool) {
 		db.maxLTXFileInfos.Lock()
 		defer db.maxLTXFileInfos.Unlock()
@@ -385,6 +403,70 @@ func NewDB(path string) *DB {
 	}
 
 	return db
+}
+
+// initMetrics creates the per-database Prometheus series.
+// Open calls it again because Close deletes them.
+func (db *DB) initMetrics() {
+	dbMetricOwners.Lock()
+	defer dbMetricOwners.Unlock()
+	if db.metricsRegistered {
+		return
+	}
+	db.metricsRegistered = true
+	dbMetricOwners.paths[db.path]++
+	dbMetricOwners.basenames[filepath.Base(db.path)]++
+
+	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
+	db.walSizeGauge = walSizeGaugeVec.WithLabelValues(db.path)
+	db.totalWALBytesCounter = totalWALBytesCounterVec.WithLabelValues(db.path)
+	db.txIDGauge = txIDIndexGaugeVec.WithLabelValues(db.path)
+	db.syncNCounter = syncNCounterVec.WithLabelValues(db.path)
+	db.syncErrorNCounter = syncErrorNCounterVec.WithLabelValues(db.path)
+	db.syncSecondsCounter = syncSecondsCounterVec.WithLabelValues(db.path)
+	db.diskFullGauge = diskFullGaugeVec.WithLabelValues(db.path)
+	db.checkpointNCounterVec = checkpointNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.checkpointErrorNCounterVec = checkpointErrorNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.checkpointSecondsCounterVec = checkpointSecondsCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.compactor.CompactionVerifyErrorCounter = compactionVerifyErrorCounterVec.WithLabelValues(db.path)
+}
+
+// deleteMetrics removes every per-database series so a process that opens many
+// databases over its lifetime does not accumulate series forever.
+func (db *DB) deleteMetrics() {
+	dbMetricOwners.Lock()
+	defer dbMetricOwners.Unlock()
+	if !db.metricsRegistered {
+		return
+	}
+	db.metricsRegistered = false
+
+	name := filepath.Base(db.path)
+	dbMetricOwners.basenames[name]--
+	if dbMetricOwners.basenames[name] == 0 {
+		delete(dbMetricOwners.basenames, name)
+		internal.L0RetentionGaugeVec.DeletePartialMatch(prometheus.Labels{"db": name})
+	}
+
+	dbMetricOwners.paths[db.path]--
+	if dbMetricOwners.paths[db.path] != 0 {
+		return
+	}
+	delete(dbMetricOwners.paths, db.path)
+
+	labels := prometheus.Labels{"db": db.path}
+	dbSizeGaugeVec.DeletePartialMatch(labels)
+	walSizeGaugeVec.DeletePartialMatch(labels)
+	totalWALBytesCounterVec.DeletePartialMatch(labels)
+	txIDIndexGaugeVec.DeletePartialMatch(labels)
+	syncNCounterVec.DeletePartialMatch(labels)
+	syncErrorNCounterVec.DeletePartialMatch(labels)
+	syncSecondsCounterVec.DeletePartialMatch(labels)
+	diskFullGaugeVec.DeletePartialMatch(labels)
+	compactionVerifyErrorCounterVec.DeletePartialMatch(labels)
+	checkpointNCounterVec.DeletePartialMatch(labels)
+	checkpointErrorNCounterVec.DeletePartialMatch(labels)
+	checkpointSecondsCounterVec.DeletePartialMatch(labels)
 }
 
 // SetLogger updates the database logger and propagates to subsystems.
@@ -1009,6 +1091,9 @@ func (db *DB) Open() (err error) {
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 	db.mu.Unlock()
 
+	// Close deletes the per-database series, so recreate them.
+	db.initMetrics()
+
 	// Validate fields on database.
 	if db.Replica == nil {
 		return fmt.Errorf("replica required before opening database")
@@ -1105,6 +1190,10 @@ func (db *DB) Close(ctx context.Context) (err error) {
 			err = e
 		}
 	}
+
+	// Remove this database's series now that the final sync has recorded
+	// its last values.
+	db.deleteMetrics()
 
 	return err
 }
@@ -1419,8 +1508,11 @@ func (db *DB) acquireReadLock(ctx context.Context) error {
 		return nil
 	}
 
-	// Start long running read-transaction to prevent checkpoints.
-	tx, err := db.db.BeginTx(ctx, nil)
+	// Start long running read-transaction to prevent checkpoints. The
+	// transaction outlives this call, and database/sql rolls it back when its
+	// BeginTx context is cancelled, so detach it from the caller's context
+	// (e.g. a control socket request that is cancelled when it returns).
+	tx, err := db.db.BeginTx(context.WithoutCancel(ctx), nil)
 	if err != nil {
 		return err
 	}
@@ -1490,6 +1582,14 @@ func (db *DB) lockExec(ctx context.Context) error {
 	return nil
 }
 
+// addDurationToCounter records positive durations without allowing a clock
+// adjustment to panic a Prometheus counter.
+func addDurationToCounter(counter prometheus.Counter, d time.Duration) {
+	if d > 0 {
+		counter.Add(d.Seconds())
+	}
+}
+
 func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syncResult, err error) {
 	db.beginSyncDiag(diagOpSync)
 	defer func() { db.finishSyncDiag(err) }()
@@ -1506,7 +1606,7 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		} else {
 			db.diskFullGauge.Set(0)
 		}
-		db.syncSecondsCounter.Add(float64(time.Since(t).Seconds()))
+		addDurationToCounter(db.syncSecondsCounter, time.Since(t))
 	}()
 
 	exec, err := db.newSyncExecutor(ctx)
@@ -2055,6 +2155,9 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	if err != nil {
 		return info, fmt.Errorf("last page match: %w", err)
 	} else if !lastPageMatch {
+		// A snapshot must hold every frame not yet in the database file,
+		// including those before the stale offset.
+		info.offset = WALHeaderSize
 		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
 		return info, nil
 	}
@@ -2128,9 +2231,16 @@ func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset
 		return false, nil
 	}
 
+	if page := db.lastLTXPage; page != nil && page.header == dec.Header() && page.pgno == pgno {
+		return bytes.Equal(data, page.data), nil
+	}
+
 	// Verify that the last page in the WAL exists in the last LTX file.
 	buf := make([]byte, dec.Header().PageSize)
 	for {
+		if err := context.Cause(ctx); err != nil {
+			return false, err
+		}
 		var hdr ltx.PageHeader
 		if err := dec.DecodePage(&hdr, buf); errors.Is(err, io.EOF) {
 			return false, nil // page not found in LTX file
@@ -2144,6 +2254,7 @@ func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset
 		if !bytes.Equal(data, buf) {
 			continue // page data doesn't match
 		}
+		db.lastLTXPage = &verifiedLTXPage{header: dec.Header(), pgno: pgno, data: bytes.Clone(buf)}
 		return true, nil // Page matches
 	}
 }
@@ -2462,6 +2573,17 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		return result, fmt.Errorf("encode ltx header: %w", err)
 	}
 
+	pageEncoder := &verifyingLTXEncoder{Encoder: enc}
+	if sz > 0 {
+		lastFrameOffset := info.offset + sz - int64(WALFrameHeaderSize+db.pageSize)
+		for pgno, offset := range pageMap {
+			if offset == lastFrameOffset {
+				pageEncoder.page.pgno = pgno
+				break
+			}
+		}
+	}
+
 	// If we need a full snapshot, then copy from the database & WAL.
 	// Otherwise, just copy incrementally from the WAL.
 	if info.snapshotting {
@@ -2472,7 +2594,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 				s.snapshotting = true
 				s.reason = info.reason
 			})
-		if err := db.writeLTXFromDB(ctx, enc, db.f, walFile, commit, pageMap); err != nil {
+		if err := db.writeLTXFromDB(ctx, pageEncoder, db.f, walFile, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
 				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 			}
@@ -2486,7 +2608,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 				s.snapshotting = false
 				s.reason = info.reason
 			})
-		if err := db.writeLTXFromWAL(ctx, enc, walFile, info.prevCommit, commit, pageMap); err != nil {
+		if err := db.writeLTXFromWAL(ctx, pageEncoder, walFile, info.prevCommit, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
 				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 			}
@@ -2542,6 +2664,11 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		db.maxLTXFileInfos.Unlock()
 		db.invalidatePosCache()
 		return result, fmt.Errorf("sync ltx dir: %w", err)
+	}
+
+	db.lastLTXPage = nil
+	if pageEncoder.page.data != nil {
+		db.lastLTXPage = &pageEncoder.page
 	}
 
 	result.synced = true
@@ -2616,7 +2743,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 // present in pageMap from walFile and the rest from dbFile. dbFile is passed
 // explicitly rather than read from db.f because the snapshot path runs
 // without execSem, where db.f may be replaced by Close.
-func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, dbFile, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
+func (db *DB) writeLTXFromDB(ctx context.Context, enc ltxPageEncoder, dbFile, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
 	lockPgno := ltx.LockPgno(uint32(db.pageSize))
 	data := make([]byte, db.pageSize)
 
@@ -2663,7 +2790,7 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, dbFile, walF
 	return nil
 }
 
-func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os.File, prevCommit, commit uint32, pageMap map[uint32]int64) error {
+func (db *DB) writeLTXFromWAL(ctx context.Context, enc ltxPageEncoder, walFile *os.File, prevCommit, commit uint32, pageMap map[uint32]int64) error {
 	// Create an ordered list of page numbers since the LTX encoder requires it.
 	pgnos := make([]uint32, 0, len(pageMap))
 	for pgno := range pageMap {
@@ -2975,7 +3102,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (walFrameN int, e
 		if err != nil {
 			db.checkpointErrorNCounterVec.With(labels).Inc()
 		}
-		db.checkpointSecondsCounterVec.With(labels).Add(float64(time.Since(t).Seconds()))
+		addDurationToCounter(db.checkpointSecondsCounterVec.With(labels), time.Since(t))
 	}()
 
 	// Ensure the read lock has been removed before issuing a checkpoint.
@@ -3267,7 +3394,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	if dstLevel == 1 {
 		if err := db.EnforceL0RetentionByTime(ctx); err != nil {
 			// Don't log context cancellation errors during shutdown
-			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if !isShutdownError(ctx, err) {
 				db.Logger.Error("enforce L0 time retention", "error", err)
 			}
 		}
@@ -3635,7 +3762,7 @@ func (db *DB) monitor() {
 			// pass so a long pass isn't followed by an immediate tick.
 			ticker.Reset(db.MonitorInterval)
 		}
-		if err != nil && !errors.Is(err, context.Canceled) {
+		if err != nil && !isShutdownError(db.ctx, err) {
 			consecutiveErrs++
 
 			// Exponential backoff: MonitorInterval -> 2x -> 4x -> ... -> max
@@ -3833,6 +3960,15 @@ func NewRestoreOptions() RestoreOptions {
 
 // Database metrics.
 var (
+	dbMetricOwners = struct {
+		sync.Mutex
+		paths     map[string]int
+		basenames map[string]int
+	}{
+		paths:     make(map[string]int),
+		basenames: make(map[string]int),
+	}
+
 	dbSizeGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "litestream_db_size",
 		Help: "The current size of the real DB",
